@@ -1,0 +1,495 @@
+﻿-- Provides executive-ready metrics: Capacity (Expected Joined AUM) and Coverage Ratio
+-- PLUS: Quarterly forecasts for "Expected to Join This Quarter" and "Expected to Join Next Quarter"
+-- UPDATED: Includes quarterly forecast metrics based on velocity and probabilities
+-- UPDATED: Uses stage_probability only (no double-counting with SQOâ†’Joined conversion rate)
+-- UPDATED: V2 Logic - Dynamic Valuation, Deal-Size Dependent Velocity, Stale Decay
+-- UPDATED: Removed "New Deal Penalty" (data shows young deals <180 days have higher win rate)
+-- UPDATED: Added "Stale Decay" (0.80x) for deals >180 days but still active
+-- 
+-- Forecast Methodology (V2 - Based on Historical Data Analysis):
+-- 1. Dynamic Valuation: Uses calculated divisors from recent joined deals (3.30/3.80)
+-- 2. Deal-Size Dependent Cycle Times:
+--    - Enterprise (>$30M): Signed=38d, Negotiating=49d, Sales Process=94d, Default=120d
+--    - Large ($15M-$30M): Signed=18d, Negotiating=37d, Sales Process=66d, Default=90d
+--    - Standard (<$15M): Signed=10d, Negotiating=18d, Sales Process=49d, Default=50d
+-- 3. Stale Decay: Deals >180 days but still active get 0.80x multiplier (momentum decay)
+--    - Fresh deals (0-180 days): Full value (1.0x) - data shows higher win rate
+--    - Older active deals (>180 days): Decay (0.80x) - primarily affects Enterprise deals
+-- 4. Dynamic Stale Logic: Deal-size dependent age cutoffs (90/120/180/240 days)
+
+WITH Dynamic_Valuation_Params AS (
+  SELECT 
+    COALESCE(AVG(SAFE_DIVIDE(Underwritten_AUM__c, Margin_AUM__c)), 3.30) AS dyn_und_div,
+    COALESCE(AVG(SAFE_DIVIDE(Amount, Margin_AUM__c)), 3.80) AS dyn_amt_div
+  FROM `savvy-gtm-analytics.SavvyGTMData.Opportunity`
+  WHERE StageName = 'Joined' 
+    AND Margin_AUM__c > 0
+    AND advisor_join_date__c >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+),
+
+Firm_Wide_Conversion_Rate AS (
+  -- Calculate firm-wide average SQO to Joined conversion rate for fallback
+  SELECT
+    AVG(sqo_to_joined_conversion_rate) AS overall_sqo_to_joined_conversion_rate
+  FROM `savvy-gtm-analytics.savvy_analytics.vw_sgm_capacity_model_refined`
+  WHERE sqo_to_joined_conversion_rate IS NOT NULL
+    AND IsActive = TRUE
+),
+
+Current_Date_Context AS (
+  SELECT
+    CURRENT_DATE() AS current_date,
+    DATE_TRUNC(CURRENT_DATE(), QUARTER) AS current_quarter_start,
+    DATE_ADD(DATE_TRUNC(CURRENT_DATE(), QUARTER), INTERVAL 3 MONTH) AS current_quarter_end,
+    DATE_ADD(DATE_TRUNC(CURRENT_DATE(), QUARTER), INTERVAL 3 MONTH) AS next_quarter_start,
+    DATE_ADD(DATE_TRUNC(CURRENT_DATE(), QUARTER), INTERVAL 6 MONTH) AS next_quarter_end
+),
+
+-- Opportunity-level data with projected join dates and quarterly assignments
+Opp_With_Forecast AS (
+  SELECT
+    o.Full_Opportunity_ID__c,
+    CASE WHEN opp_owner_user.Is_SGM__c = TRUE THEN opp_owner_user.Name ELSE NULL END AS sgm_name,
+    opp_owner_user.Id AS sgm_user_id,
+    o.StageName,
+    o.Date_Became_SQO__c,
+    o.Margin_AUM__c,
+    o.Underwritten_AUM__c,
+    o.Amount,
+    o.Stage_Entered_Signed__c,
+    o.Stage_Entered_Negotiating__c,
+    o.Stage_Entered_Sales_Process__c,
+    o.Stage_Entered_Discovery__c,
+    -- Estimated Margin_AUM__c using V2 dynamic fallback logic:
+    CASE
+      WHEN o.Margin_AUM__c IS NOT NULL AND o.Margin_AUM__c > 0 THEN o.Margin_AUM__c / 1000000
+      WHEN o.Underwritten_AUM__c IS NOT NULL AND o.Underwritten_AUM__c > 0 THEN (o.Underwritten_AUM__c / vp.dyn_und_div) / 1000000
+      WHEN o.Amount IS NOT NULL AND o.Amount > 0 THEN (o.Amount / vp.dyn_amt_div) / 1000000
+      ELSE 0
+    END AS estimated_margin_aum,
+    -- Stage probability
+    COALESCE(cr.probability_to_join, 0) AS stage_probability,
+    -- SQO age in days
+    CASE 
+      WHEN LOWER(o.SQL__c) = 'yes' AND o.Date_Became_SQO__c IS NOT NULL
+      THEN DATE_DIFF(c.current_date, DATE(o.Date_Became_SQO__c), DAY)
+      ELSE NULL
+    END AS sqo_age_days,
+    -- Pipeline status
+    CASE 
+      WHEN o.IsClosed = FALSE 
+        AND o.advisor_join_date__c IS NULL 
+        AND o.StageName != 'Closed Lost'
+        AND o.StageName != 'On Hold'
+        AND o.StageName IS NOT NULL
+        AND LOWER(o.SQL__c) = 'yes'
+      THEN 1 
+      ELSE 0 
+    END AS is_in_pipeline,
+    -- Calculate projected join date based on V2 deal-size dependent cycle times
+    CASE
+      WHEN o.Date_Became_SQO__c IS NOT NULL AND o.advisor_join_date__c IS NULL THEN
+        CASE
+          -- Determine deal size bucket for cycle time calculation
+          WHEN (CASE WHEN o.Margin_AUM__c > 0 THEN o.Margin_AUM__c ELSE COALESCE(o.Underwritten_AUM__c/vp.dyn_und_div, o.Amount/vp.dyn_amt_div) END) >= 30000000 THEN
+            -- Enterprise (>$30M)
+            CASE
+              WHEN o.Stage_Entered_Signed__c IS NOT NULL AND DATE(o.Stage_Entered_Signed__c) <= c.current_date
+                THEN DATE_ADD(DATE(o.Stage_Entered_Signed__c), INTERVAL 38 DAY)
+              WHEN o.Stage_Entered_Negotiating__c IS NOT NULL AND DATE(o.Stage_Entered_Negotiating__c) <= c.current_date
+                THEN DATE_ADD(DATE(o.Stage_Entered_Negotiating__c), INTERVAL 49 DAY)
+              WHEN o.Stage_Entered_Sales_Process__c IS NOT NULL AND DATE(o.Stage_Entered_Sales_Process__c) <= c.current_date
+                THEN DATE_ADD(DATE(o.Stage_Entered_Sales_Process__c), INTERVAL 94 DAY)
+              ELSE DATE_ADD(DATE(o.Date_Became_SQO__c), INTERVAL 120 DAY)
+            END
+          WHEN (CASE WHEN o.Margin_AUM__c > 0 THEN o.Margin_AUM__c ELSE COALESCE(o.Underwritten_AUM__c/vp.dyn_und_div, o.Amount/vp.dyn_amt_div) END) >= 15000000 THEN
+            -- Large ($15M-$30M)
+            CASE
+              WHEN o.Stage_Entered_Signed__c IS NOT NULL AND DATE(o.Stage_Entered_Signed__c) <= c.current_date
+                THEN DATE_ADD(DATE(o.Stage_Entered_Signed__c), INTERVAL 18 DAY)
+              WHEN o.Stage_Entered_Negotiating__c IS NOT NULL AND DATE(o.Stage_Entered_Negotiating__c) <= c.current_date
+                THEN DATE_ADD(DATE(o.Stage_Entered_Negotiating__c), INTERVAL 37 DAY)
+              WHEN o.Stage_Entered_Sales_Process__c IS NOT NULL AND DATE(o.Stage_Entered_Sales_Process__c) <= c.current_date
+                THEN DATE_ADD(DATE(o.Stage_Entered_Sales_Process__c), INTERVAL 66 DAY)
+              ELSE DATE_ADD(DATE(o.Date_Became_SQO__c), INTERVAL 90 DAY)
+            END
+          ELSE
+            -- Standard (<$15M)
+            CASE
+              WHEN o.Stage_Entered_Signed__c IS NOT NULL AND DATE(o.Stage_Entered_Signed__c) <= c.current_date
+                THEN DATE_ADD(DATE(o.Stage_Entered_Signed__c), INTERVAL 10 DAY)
+              WHEN o.Stage_Entered_Negotiating__c IS NOT NULL AND DATE(o.Stage_Entered_Negotiating__c) <= c.current_date
+                THEN DATE_ADD(DATE(o.Stage_Entered_Negotiating__c), INTERVAL 18 DAY)
+              WHEN o.Stage_Entered_Sales_Process__c IS NOT NULL AND DATE(o.Stage_Entered_Sales_Process__c) <= c.current_date
+                THEN DATE_ADD(DATE(o.Stage_Entered_Sales_Process__c), INTERVAL 49 DAY)
+              ELSE DATE_ADD(DATE(o.Date_Became_SQO__c), INTERVAL 50 DAY)
+            END
+        END
+      ELSE NULL
+    END AS projected_join_date,
+    -- Determine which quarter the deal is projected to close in (using V2 deal-size dependent logic)
+    CASE
+      WHEN o.Date_Became_SQO__c IS NOT NULL AND o.advisor_join_date__c IS NULL THEN
+        CASE
+          -- Determine deal size bucket for cycle time calculation
+          WHEN (CASE WHEN o.Margin_AUM__c > 0 THEN o.Margin_AUM__c ELSE COALESCE(o.Underwritten_AUM__c/vp.dyn_und_div, o.Amount/vp.dyn_amt_div) END) >= 30000000 THEN
+            -- Enterprise (>$30M)
+            CASE
+              WHEN o.Stage_Entered_Signed__c IS NOT NULL AND DATE(o.Stage_Entered_Signed__c) <= c.current_date THEN
+                CASE
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Signed__c), INTERVAL 38 DAY) <= c.current_quarter_end THEN 'Current Quarter'
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Signed__c), INTERVAL 38 DAY) <= c.next_quarter_end THEN 'Next Quarter'
+                  ELSE 'Beyond Next Quarter'
+                END
+              WHEN o.Stage_Entered_Negotiating__c IS NOT NULL AND DATE(o.Stage_Entered_Negotiating__c) <= c.current_date THEN
+                CASE
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Negotiating__c), INTERVAL 49 DAY) <= c.current_quarter_end THEN 'Current Quarter'
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Negotiating__c), INTERVAL 49 DAY) <= c.next_quarter_end THEN 'Next Quarter'
+                  ELSE 'Beyond Next Quarter'
+                END
+              WHEN o.Stage_Entered_Sales_Process__c IS NOT NULL AND DATE(o.Stage_Entered_Sales_Process__c) <= c.current_date THEN
+                CASE
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Sales_Process__c), INTERVAL 94 DAY) <= c.current_quarter_end THEN 'Current Quarter'
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Sales_Process__c), INTERVAL 94 DAY) <= c.next_quarter_end THEN 'Next Quarter'
+                  ELSE 'Beyond Next Quarter'
+                END
+              ELSE
+                CASE
+                  WHEN DATE_ADD(DATE(o.Date_Became_SQO__c), INTERVAL 120 DAY) <= c.current_quarter_end THEN 'Current Quarter'
+                  WHEN DATE_ADD(DATE(o.Date_Became_SQO__c), INTERVAL 120 DAY) <= c.next_quarter_end THEN 'Next Quarter'
+                  ELSE 'Beyond Next Quarter'
+                END
+            END
+          WHEN (CASE WHEN o.Margin_AUM__c > 0 THEN o.Margin_AUM__c ELSE COALESCE(o.Underwritten_AUM__c/vp.dyn_und_div, o.Amount/vp.dyn_amt_div) END) >= 15000000 THEN
+            -- Large ($15M-$30M)
+            CASE
+              WHEN o.Stage_Entered_Signed__c IS NOT NULL AND DATE(o.Stage_Entered_Signed__c) <= c.current_date THEN
+                CASE
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Signed__c), INTERVAL 18 DAY) <= c.current_quarter_end THEN 'Current Quarter'
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Signed__c), INTERVAL 18 DAY) <= c.next_quarter_end THEN 'Next Quarter'
+                  ELSE 'Beyond Next Quarter'
+                END
+              WHEN o.Stage_Entered_Negotiating__c IS NOT NULL AND DATE(o.Stage_Entered_Negotiating__c) <= c.current_date THEN
+                CASE
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Negotiating__c), INTERVAL 37 DAY) <= c.current_quarter_end THEN 'Current Quarter'
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Negotiating__c), INTERVAL 37 DAY) <= c.next_quarter_end THEN 'Next Quarter'
+                  ELSE 'Beyond Next Quarter'
+                END
+              WHEN o.Stage_Entered_Sales_Process__c IS NOT NULL AND DATE(o.Stage_Entered_Sales_Process__c) <= c.current_date THEN
+                CASE
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Sales_Process__c), INTERVAL 66 DAY) <= c.current_quarter_end THEN 'Current Quarter'
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Sales_Process__c), INTERVAL 66 DAY) <= c.next_quarter_end THEN 'Next Quarter'
+                  ELSE 'Beyond Next Quarter'
+                END
+              ELSE
+                CASE
+                  WHEN DATE_ADD(DATE(o.Date_Became_SQO__c), INTERVAL 90 DAY) <= c.current_quarter_end THEN 'Current Quarter'
+                  WHEN DATE_ADD(DATE(o.Date_Became_SQO__c), INTERVAL 90 DAY) <= c.next_quarter_end THEN 'Next Quarter'
+                  ELSE 'Beyond Next Quarter'
+                END
+            END
+          ELSE
+            -- Standard (<$15M)
+            CASE
+              WHEN o.Stage_Entered_Signed__c IS NOT NULL AND DATE(o.Stage_Entered_Signed__c) <= c.current_date THEN
+                CASE
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Signed__c), INTERVAL 10 DAY) <= c.current_quarter_end THEN 'Current Quarter'
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Signed__c), INTERVAL 10 DAY) <= c.next_quarter_end THEN 'Next Quarter'
+                  ELSE 'Beyond Next Quarter'
+                END
+              WHEN o.Stage_Entered_Negotiating__c IS NOT NULL AND DATE(o.Stage_Entered_Negotiating__c) <= c.current_date THEN
+                CASE
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Negotiating__c), INTERVAL 18 DAY) <= c.current_quarter_end THEN 'Current Quarter'
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Negotiating__c), INTERVAL 18 DAY) <= c.next_quarter_end THEN 'Next Quarter'
+                  ELSE 'Beyond Next Quarter'
+                END
+              WHEN o.Stage_Entered_Sales_Process__c IS NOT NULL AND DATE(o.Stage_Entered_Sales_Process__c) <= c.current_date THEN
+                CASE
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Sales_Process__c), INTERVAL 49 DAY) <= c.current_quarter_end THEN 'Current Quarter'
+                  WHEN DATE_ADD(DATE(o.Stage_Entered_Sales_Process__c), INTERVAL 49 DAY) <= c.next_quarter_end THEN 'Next Quarter'
+                  ELSE 'Beyond Next Quarter'
+                END
+              ELSE
+                CASE
+                  WHEN DATE_ADD(DATE(o.Date_Became_SQO__c), INTERVAL 50 DAY) <= c.current_quarter_end THEN 'Current Quarter'
+                  WHEN DATE_ADD(DATE(o.Date_Became_SQO__c), INTERVAL 50 DAY) <= c.next_quarter_end THEN 'Next Quarter'
+                  ELSE 'Beyond Next Quarter'
+                END
+            END
+        END
+      ELSE NULL
+    END AS forecast_quarter
+  FROM `savvy-gtm-analytics.SavvyGTMData.Opportunity` o
+  LEFT JOIN `savvy-gtm-analytics.SavvyGTMData.User` opp_owner_user
+    ON o.OwnerId = opp_owner_user.Id
+  LEFT JOIN `savvy-gtm-analytics.savvy_analytics.vw_stage_to_joined_probability` cr
+    ON o.StageName = cr.StageName
+  CROSS JOIN Current_Date_Context c
+  CROSS JOIN Dynamic_Valuation_Params vp
+  WHERE o.recordtypeid = '012Dn000000mrO3IAI'
+    AND opp_owner_user.Is_SGM__c = TRUE
+    AND opp_owner_user.IsActive = TRUE
+),
+
+-- Calculate quarterly forecasts per SGM
+SGM_Quarterly_Forecast AS (
+  SELECT
+    o.sgm_name,
+    -- Current Quarter Forecast: Expected Margin AUM Ã— Stage Probability Ã— Stale Decay
+    -- UPDATED: Removed "New Deal Penalty" (data shows young deals have higher win rate)
+    -- UPDATED: Added "Stale Decay" (0.80x) for deals >180 days but still active
+    SUM(CASE 
+      WHEN o.is_in_pipeline = 1
+        AND o.forecast_quarter = 'Current Quarter'
+        AND (
+          -- Dynamic stale logic based on deal size
+          (o.estimated_margin_aum < 5 AND (o.sqo_age_days IS NULL OR o.sqo_age_days <= 90))
+          OR (o.estimated_margin_aum >= 5 AND o.estimated_margin_aum < 15 AND (o.sqo_age_days IS NULL OR o.sqo_age_days <= 120))
+          OR (o.estimated_margin_aum >= 15 AND o.estimated_margin_aum < 30 AND (o.sqo_age_days IS NULL OR o.sqo_age_days <= 180))
+          OR (o.estimated_margin_aum >= 30 AND (o.sqo_age_days IS NULL OR o.sqo_age_days <= 240))
+        )
+      THEN o.estimated_margin_aum * o.stage_probability * 
+        CASE 
+          -- Stale Decay: Deals >180 days but still active get 0.80x (momentum decay)
+          -- This primarily affects Enterprise deals (â‰¥$30M) which have 240-day stale threshold
+          WHEN o.sqo_age_days IS NOT NULL AND o.sqo_age_days > 180 THEN 0.80
+          -- Fresh deals (0-180 days): Full value (data shows they have higher win rate)
+          ELSE 1.0
+        END
+      ELSE 0
+    END) AS current_quarter_forecast_weighted_margin_aum_estimate,
+    -- Next Quarter Forecast: Expected Margin AUM Ã— Stage Probability Ã— Stale Decay
+    SUM(CASE 
+      WHEN o.is_in_pipeline = 1
+        AND o.forecast_quarter = 'Next Quarter'
+        AND (
+          -- Dynamic stale logic based on deal size
+          (o.estimated_margin_aum < 5 AND (o.sqo_age_days IS NULL OR o.sqo_age_days <= 90))
+          OR (o.estimated_margin_aum >= 5 AND o.estimated_margin_aum < 15 AND (o.sqo_age_days IS NULL OR o.sqo_age_days <= 120))
+          OR (o.estimated_margin_aum >= 15 AND o.estimated_margin_aum < 30 AND (o.sqo_age_days IS NULL OR o.sqo_age_days <= 180))
+          OR (o.estimated_margin_aum >= 30 AND (o.sqo_age_days IS NULL OR o.sqo_age_days <= 240))
+        )
+      THEN o.estimated_margin_aum * o.stage_probability * 
+        CASE 
+          -- Stale Decay: Deals >180 days but still active get 0.80x (momentum decay)
+          -- This primarily affects Enterprise deals (â‰¥$30M) which have 240-day stale threshold
+          WHEN o.sqo_age_days IS NOT NULL AND o.sqo_age_days > 180 THEN 0.80
+          -- Fresh deals (0-180 days): Full value (data shows they have higher win rate)
+          ELSE 1.0
+        END
+      ELSE 0
+    END) AS next_quarter_forecast_weighted_margin_aum_estimate
+  FROM Opp_With_Forecast o
+  WHERE o.sgm_name IS NOT NULL
+  GROUP BY o.sgm_name
+),
+
+SGM_Data AS (
+  SELECT
+    r.sgm_name,
+    r.sgm_user_id,
+    r.Is_SGM__c,
+    r.IsActive,
+    r.current_pipeline_active_weighted_margin_aum_estimate,
+    r.current_pipeline_sqo_weighted_margin_aum,
+    r.current_pipeline_sqo_weighted_margin_aum_estimate,
+    r.current_pipeline_sqo_margin_aum,
+    r.current_pipeline_sqo_margin_aum_estimate,
+    r.current_pipeline_sqo_count,
+    r.current_pipeline_stale_sqo_count,
+    r.sqo_to_joined_conversion_rate,
+    r.avg_margin_aum_per_joined,
+    r.enterprise_365_average_margin_aum,
+    r.enterprise_365_sqo_to_joined_conversion,
+    r.standard_365_average_margin_aum,
+    r.standard_365_sqo_to_joined_conversion,
+    r.required_sqos_per_quarter,
+    r.current_quarter_joined_margin_aum,
+    r.current_quarter_joined_pct_of_target,
+    r.as_of_date,
+    u.CreatedDate AS sgm_created_date,
+    -- Determine if SGM is "On Ramp" (created within 120 days)
+    CASE
+      WHEN DATE_DIFF(CURRENT_DATE(), DATE(u.CreatedDate), DAY) <= 120 THEN 1
+      ELSE 0
+    END AS is_on_ramp,
+    -- Use firm-wide conversion rate for "On Ramp" SGMs, otherwise use individual rate
+    CASE
+      WHEN DATE_DIFF(CURRENT_DATE(), DATE(u.CreatedDate), DAY) <= 120 
+        THEN f.overall_sqo_to_joined_conversion_rate
+      ELSE COALESCE(r.sqo_to_joined_conversion_rate, f.overall_sqo_to_joined_conversion_rate)
+    END AS effective_sqo_to_joined_conversion_rate,
+    -- Quarterly forecast values (weighted pipeline, before conversion rate)
+    COALESCE(qf.current_quarter_forecast_weighted_margin_aum_estimate, 0) AS current_quarter_forecast_weighted_margin_aum_estimate,
+    COALESCE(qf.next_quarter_forecast_weighted_margin_aum_estimate, 0) AS next_quarter_forecast_weighted_margin_aum_estimate
+  FROM `savvy-gtm-analytics.savvy_analytics.vw_sgm_capacity_model_refined` r
+  LEFT JOIN `savvy-gtm-analytics.SavvyGTMData.User` u
+    ON r.sgm_user_id = u.Id
+  CROSS JOIN Firm_Wide_Conversion_Rate f
+  LEFT JOIN SGM_Quarterly_Forecast qf
+    ON r.sgm_name = qf.sgm_name
+  WHERE r.IsActive = TRUE
+)
+
+SELECT
+  sgm_name,
+  sgm_user_id,
+  Is_SGM__c,
+  IsActive,
+  
+  -- TARGET
+  36.75 AS quarterly_target_margin_aum_millions,
+  
+  -- CAPACITY CALCULATION (ESTIMATE VERSION)
+  -- Expected Quarterly Joined AUM = Active Weighted Pipeline Value
+  -- Uses estimates (includes fallback calculations for missing Margin_AUM__c)
+  -- The weighted pipeline already accounts for stage-specific conversion probabilities (stage_probability)
+  -- No additional conversion rate multiplication needed (would be double-counting)
+  COALESCE(
+    current_pipeline_active_weighted_margin_aum_estimate,
+    0
+  ) AS sgm_capacity_expected_joined_aum_millions_estimate,
+  
+  -- CAPACITY CALCULATION (ACTUAL VERSION - includes stale deals)
+  -- Uses only actual Margin_AUM__c values (no estimates)
+  -- NOTE: This includes stale deals, so it's higher than the active estimate version
+  -- The weighted pipeline already accounts for stage-specific conversion probabilities
+  COALESCE(
+    current_pipeline_sqo_weighted_margin_aum,
+    0
+  ) AS sgm_capacity_expected_joined_aum_millions_actual_includes_stale,
+  
+  -- *** QUARTERLY FORECASTS ***
+  -- Expected to Join THIS QUARTER (from pipeline only)
+  -- Formula: Weighted Pipeline Value (for deals projected this quarter)
+  -- Stage probability already accounts for conversion, no additional conversion rate needed
+  COALESCE(
+    current_quarter_forecast_weighted_margin_aum_estimate,
+    0
+  ) AS expected_to_join_this_quarter_margin_aum_millions,
+  
+  -- Expected to Join NEXT QUARTER (from pipeline only)
+  -- Formula: Weighted Pipeline Value (for deals projected next quarter)
+  -- Stage probability already accounts for conversion, no additional conversion rate needed
+  COALESCE(
+    next_quarter_forecast_weighted_margin_aum_estimate,
+    0
+  ) AS expected_to_join_next_quarter_margin_aum_millions,
+  
+  -- *** TOTAL EXPECTED FOR CURRENT QUARTER ***
+  -- Combines: Actual Joined This Quarter + Expected from Pipeline for Rest of Quarter
+  -- This gives the complete picture: What's already happened + What we expect to happen
+  -- Stage probability already accounts for conversion, no additional conversion rate needed
+  COALESCE(current_quarter_joined_margin_aum, 0) + 
+  COALESCE(
+    current_quarter_forecast_weighted_margin_aum_estimate,
+    0
+  ) AS total_expected_current_quarter_margin_aum_millions,
+  
+  -- *** TOTAL EXPECTED FOR NEXT QUARTER ***
+  -- This is just the forecast from pipeline (no actuals yet for next quarter)
+  -- Stage probability already accounts for conversion, no additional conversion rate needed
+  COALESCE(
+    next_quarter_forecast_weighted_margin_aum_estimate,
+    0
+  ) AS total_expected_next_quarter_margin_aum_millions,
+  
+  -- COVERAGE RATIO (ESTIMATE VERSION)
+  -- Coverage = Capacity / Target
+  -- 1.00 = Perfectly staffed, >1.00 = Sufficient capacity, <1.00 = Under-capacity
+  -- Uses weighted pipeline directly (stage probabilities already accounted for)
+  SAFE_DIVIDE(
+    COALESCE(
+      current_pipeline_active_weighted_margin_aum_estimate,
+      0
+    ),
+    36.75
+  ) AS coverage_ratio_estimate,
+  
+  -- COVERAGE RATIO (ACTUAL VERSION - includes stale deals)
+  -- Uses weighted pipeline directly (stage probabilities already accounted for)
+  SAFE_DIVIDE(
+    COALESCE(
+      current_pipeline_sqo_weighted_margin_aum,
+      0
+    ),
+    36.75
+  ) AS coverage_ratio_actual_includes_stale,
+  
+  -- *** COVERAGE STATUS LOGIC ***
+  -- Checks for "On Ramp" status first (SGM created within 120 days)
+  -- Uses weighted pipeline directly (stage probabilities already accounted for)
+  CASE
+    WHEN is_on_ramp = 1 THEN 'On Ramp'
+    WHEN SAFE_DIVIDE(
+      COALESCE(
+        current_pipeline_active_weighted_margin_aum_estimate,
+        0
+      ),
+      36.75
+    ) >= 1.0 THEN 'Sufficient'
+    WHEN SAFE_DIVIDE(
+      COALESCE(
+        current_pipeline_active_weighted_margin_aum_estimate,
+        0
+      ),
+      36.75
+    ) >= 0.85 THEN 'At Risk'
+    ELSE 'Under-Capacity'
+  END AS coverage_status,
+  
+  -- SUPPORTING METRICS (for context)
+  -- Pipeline Values (both actual and estimate)
+  -- ACTIVE (non-stale) weighted value - estimate only (most realistic for capacity planning)
+  current_pipeline_active_weighted_margin_aum_estimate AS active_weighted_pipeline_value_millions_estimate,
+  -- TOTAL weighted value (includes stale) - actual values only
+  current_pipeline_sqo_weighted_margin_aum AS total_weighted_pipeline_value_millions_actual,
+  -- TOTAL weighted value (includes stale) - with estimates
+  current_pipeline_sqo_weighted_margin_aum_estimate AS total_weighted_pipeline_value_millions_estimate,
+  -- Unweighted pipeline values
+  current_pipeline_sqo_margin_aum AS pipeline_sqo_margin_aum_actual,
+  current_pipeline_sqo_margin_aum_estimate AS pipeline_sqo_margin_aum_estimate,
+  
+  -- SQO Counts
+  current_pipeline_sqo_count AS active_sqo_count,
+  (current_pipeline_sqo_count - current_pipeline_stale_sqo_count) AS non_stale_sqo_count,
+  current_pipeline_stale_sqo_count AS stale_sqo_count,
+  
+  -- Conversion Metrics (for reference only - not used in capacity calculations)
+  sqo_to_joined_conversion_rate AS sqo_to_joined_conversion_rate, -- Individual rate (12-month historical, for reference)
+  effective_sqo_to_joined_conversion_rate AS effective_sqo_to_joined_conversion_rate, -- For reference (not used in calculations)
+  avg_margin_aum_per_joined AS avg_margin_aum_per_joined_millions,
+  
+  -- Enterprise/Standard Metrics (for Looker Studio scorecard visibility)
+  -- These show which metrics are being used for required_sqos_per_quarter calculations
+  enterprise_365_average_margin_aum AS enterprise_365_average_margin_aum,
+  enterprise_365_sqo_to_joined_conversion AS enterprise_365_sqo_to_joined_conversion,
+  standard_365_average_margin_aum AS standard_365_average_margin_aum,
+  standard_365_sqo_to_joined_conversion AS standard_365_sqo_to_joined_conversion,
+  required_sqos_per_quarter AS required_sqos_per_quarter, -- Uses enterprise metrics for Bre, standard for others
+  
+  -- CURRENT QUARTER ACTUALS (for comparison)
+  current_quarter_joined_margin_aum AS current_quarter_actual_joined_aum_millions,
+  current_quarter_joined_pct_of_target AS current_quarter_pct_of_target,
+  
+  -- GAP METRICS (using estimate - more complete)
+  -- Uses weighted pipeline directly (stage probabilities already accounted for)
+  36.75 - COALESCE(
+    current_pipeline_active_weighted_margin_aum_estimate,
+    0
+  ) AS capacity_gap_millions_estimate,
+  
+  -- GAP METRICS (using actual - includes stale, so gap appears smaller)
+  -- Uses weighted pipeline directly (stage probabilities already accounted for)
+  36.75 - COALESCE(
+    current_pipeline_sqo_weighted_margin_aum,
+    0
+  ) AS capacity_gap_millions_actual_includes_stale,
+  
+  as_of_date,
+  sgm_created_date,
+  is_on_ramp -- Flag indicating if SGM is On Ramp (for reference)
+
+FROM SGM_Data
+ORDER BY coverage_ratio_estimate ASC, sgm_name
+

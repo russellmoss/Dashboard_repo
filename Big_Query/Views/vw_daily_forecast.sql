@@ -13,7 +13,7 @@ Date_Spine AS (
 -- 2. Get monthly forecast targets from the forecast table (Cohort_source metric only)
 Monthly_Forecast_Targets AS (
   SELECT
-    CASE WHEN Channel = 'Inbound' THEN 'Marketing' ELSE Channel END AS channel_grouping_name,
+    COALESCE(cg.Channel_Grouping_Name, CASE WHEN Channel = 'Inbound' THEN 'Marketing' ELSE Channel END) AS channel_grouping_name,
     original_source,
     CASE
       WHEN LOWER(stage) = 'sql' THEN 'sqls'
@@ -30,7 +30,9 @@ Monthly_Forecast_Targets AS (
       WHEN month_key = '2025-12' THEN 31
       ELSE 30
     END AS days_in_month
-  FROM `savvy-gtm-analytics.SavvyGTMData.q4_2025_forecast`
+  FROM `savvy-gtm-analytics.SavvyGTMData.q4_2025_forecast` f
+  LEFT JOIN `savvy-gtm-analytics.SavvyGTMData.Channel_Group_Mapping` cg
+    ON f.original_source = cg.Original_Source_Salesforce
   WHERE metric = 'Cohort_source'
     AND original_source != 'All'
     AND month_key IN ('2025-10', '2025-11', '2025-12')

@@ -1,0 +1,228 @@
+{
+  "table_name": "User",
+  "full_table_path": "savvy-gtm-analytics.SavvyGTMData.User",
+  "description": "Salesforce User object containing user/employee information. Used to identify SGA (Sales Growth Advisor), SGM (Sales Growth Manager), and record owners for Leads and Opportunities.",
+  "relationships": {
+    "owns_leads": {
+      "relationship_type": "one_to_many",
+      "related_table": "Lead",
+      "join_key_user": "Id",
+      "join_key_lead": "OwnerID",
+      "description": "User.Id = Lead.OwnerID. A user can own multiple leads."
+    },
+    "owns_opportunities": {
+      "relationship_type": "one_to_many",
+      "related_table": "Opportunity",
+      "join_key_user": "Id",
+      "join_key_opportunity": "OwnerId",
+      "description": "User.Id = Opportunity.OwnerId. A user can own multiple opportunities."
+    },
+    "assigned_as_sga_to_opportunities": {
+      "relationship_type": "one_to_many",
+      "related_table": "Opportunity",
+      "join_key_user": "Id",
+      "join_key_opportunity": "SGA__c",
+      "description": "User.Id = Opportunity.SGA__c. A user can be assigned as SGA to multiple opportunities."
+    },
+    "assigned_as_sga_to_leads": {
+      "relationship_type": "one_to_many",
+      "related_table": "Lead",
+      "join_key_user": "Name",
+      "join_key_lead": "SGA_Owner_Name__c",
+      "description": "User.Name = Lead.SGA_Owner_Name__c. A user can be assigned as SGA to multiple leads (by name match)."
+    }
+  },
+  "key_fields": {
+    "Id": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Salesforce unique identifier for User record",
+      "usage_in_codebase": "Primary key, used in joins with Lead.OwnerID, Opportunity.OwnerId, and Opportunity.SGA__c"
+    },
+    "Name": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Full name of the user (FirstName + LastName)",
+      "usage_in_codebase": "Used to join with Lead.SGA_Owner_Name__c and to identify SGA/SGM names"
+    },
+    "FirstName": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "First name of the user",
+      "usage_in_codebase": "Included in views as Lead_Owner_FirstName, Opp_Owner_FirstName"
+    },
+    "LastName": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Last name of the user",
+      "usage_in_codebase": "Included in views as Lead_Owner_LastName, Opp_Owner_LastName"
+    },
+    "IsActive": {
+      "data_type": "BOOL",
+      "nullable": true,
+      "description": "Indicates if the user is currently active in Salesforce",
+      "usage_in_codebase": "Used to filter active users: (IsSGA__c = TRUE OR Is_SGM__c = TRUE) AND IsActive = TRUE"
+    },
+    "IsSGA__c": {
+      "data_type": "BOOL",
+      "nullable": true,
+      "description": "Indicates if the user is a Sales Growth Advisor (SGA)",
+      "usage_in_codebase": "Used to identify SGA users and filter active SGAs. Included in views as Lead_Owner_IsSGA__c, Opp_Owner_IsSGA__c, SGA_IsSGA__c"
+    },
+    "Is_SGM__c": {
+      "data_type": "BOOL",
+      "nullable": true,
+      "description": "Indicates if the user is a Sales Growth Manager (SGM)",
+      "usage_in_codebase": "Used to identify SGM users and filter active SGMs. Included in views as Lead_Owner_Is_SGM__c, Opp_Owner_Is_SGM__c, SGA_Is_SGM__c. Used to derive sgm_name from Opportunity Owner."
+    },
+    "Full_User_ID__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Custom unique identifier for user",
+      "usage_in_codebase": "Available but not heavily used in current views"
+    }
+  },
+  "role_fields": {
+    "IsSGA__c": {
+      "data_type": "BOOL",
+      "nullable": true,
+      "description": "Sales Growth Advisor flag",
+      "usage_in_codebase": "Used in Active_SGA_SGM_Users CTE to filter: (IsSGA__c = TRUE OR Is_SGM__c = TRUE) AND IsActive = TRUE"
+    },
+    "Is_SGM__c": {
+      "data_type": "BOOL",
+      "nullable": true,
+      "description": "Sales Growth Manager flag",
+      "usage_in_codebase": "Used in Active_SGA_SGM_Users CTE and to identify SGM from Opportunity Owner: CASE WHEN opp_owner_user.is_SGM__c = TRUE THEN opp_owner_user.Name ELSE NULL END AS sgm_name"
+    },
+    "Skip_Lead_Routing__c": {
+      "data_type": "BOOL",
+      "nullable": true,
+      "description": "Flag to skip lead routing for this user",
+      "usage_in_codebase": "Available but not used in current analytics views"
+    },
+    "SGA_Lead_Routing_Number__c": {
+      "data_type": "FLOAT64",
+      "nullable": true,
+      "description": "Lead routing number for SGA",
+      "usage_in_codebase": "Available but not used in current analytics views"
+    }
+  },
+  "standard_salesforce_fields": {
+    "CreatedDate": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when User record was created in Salesforce",
+      "usage_in_codebase": "Available but not used in current analytics views"
+    },
+    "LastModifiedDate": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when User record was last modified",
+      "usage_in_codebase": "Available but not used in current analytics views"
+    },
+    "Email": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Email address of the user",
+      "usage_in_codebase": "Available but not used in current analytics views"
+    },
+    "Phone": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Phone number of the user",
+      "usage_in_codebase": "Available but not used in current analytics views"
+    },
+    "IsActive": {
+      "data_type": "BOOL",
+      "nullable": true,
+      "description": "Indicates if user is active",
+      "usage_in_codebase": "Critical field used to filter active SGA/SGM users"
+    },
+    "Username": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Salesforce username",
+      "usage_in_codebase": "Available but not used in current analytics views"
+    }
+  },
+  "usage_patterns": {
+    "lead_owner_enrichment": {
+      "description": "Enriches Lead records with owner information",
+      "join": "Lead.OwnerID = User.Id",
+      "fields_retrieved": ["Id", "IsSGA__c", "Is_SGM__c", "IsActive", "FirstName", "LastName"],
+      "aliases": {
+        "Id": "Lead_Owner_Id",
+        "IsSGA__c": "Lead_Owner_IsSGA__c",
+        "Is_SGM__c": "Lead_Owner_Is_SGM__c",
+        "IsActive": "Lead_Owner_IsActive",
+        "FirstName": "Lead_Owner_FirstName",
+        "LastName": "Lead_Owner_LastName"
+      }
+    },
+    "opportunity_owner_enrichment": {
+      "description": "Enriches Opportunity records with owner information",
+      "join": "Opportunity.OwnerId = User.Id",
+      "fields_retrieved": ["Id", "IsSGA__c", "Is_SGM__c", "IsActive", "FirstName", "LastName", "Name"],
+      "aliases": {
+        "Id": "Opp_Owner_Id",
+        "IsSGA__c": "Opp_Owner_IsSGA__c",
+        "Is_SGM__c": "Opp_Owner_Is_SGM__c",
+        "IsActive": "Opp_Owner_IsActive",
+        "FirstName": "Opp_Owner_FirstName",
+        "LastName": "Opp_Owner_LastName"
+      },
+      "sgm_derivation": "If opp_owner_user.is_SGM__c = TRUE, then opp_owner_user.Name is used as sgm_name"
+    },
+    "sga_enrichment_from_opportunity": {
+      "description": "Enriches Opportunity records with assigned SGA information",
+      "join": "Opportunity.SGA__c = User.Id",
+      "fields_retrieved": ["Name"],
+      "alias": "sga_name_from_opp",
+      "usage": "Used as fallback when Lead.SGA_Owner_Name__c = 'Savvy Marketing'"
+    },
+    "sga_enrichment_from_lead": {
+      "description": "Enriches Lead records with assigned SGA information (by name match)",
+      "join": "Lead.SGA_Owner_Name__c = User.Name",
+      "fields_retrieved": ["Id", "IsSGA__c", "Is_SGM__c", "IsActive"],
+      "aliases": {
+        "Id": "SGA_User_Id",
+        "IsSGA__c": "SGA_IsSGA__c",
+        "Is_SGM__c": "SGA_Is_SGM__c",
+        "IsActive": "SGA_IsActive"
+      },
+      "derived_field": "SGA_IsActiveSGA = (SGA_IsSGA__c = TRUE OR SGA_Is_SGM__c = TRUE) AND SGA_IsActive = TRUE"
+    },
+    "active_sga_sgm_filter": {
+      "description": "Filters to only active SGA or SGM users",
+      "query_pattern": "SELECT DISTINCT Name FROM User WHERE (IsSGA__c = TRUE OR Is_SGM__c = TRUE) AND IsActive = TRUE",
+      "usage": "Used in Active_SGA_SGM_Users CTE to filter funnel data to only active SGA/SGM assigned records"
+    }
+  },
+  "role_definitions": {
+    "SGA": {
+      "field": "IsSGA__c",
+      "definition": "Sales Growth Advisor - responsible for managing leads and opportunities",
+      "filter": "IsSGA__c = TRUE AND IsActive = TRUE"
+    },
+    "SGM": {
+      "field": "Is_SGM__c",
+      "definition": "Sales Growth Manager - manages SGAs, can be identified from Opportunity Owner",
+      "filter": "Is_SGM__c = TRUE AND IsActive = TRUE"
+    },
+    "Active_SGA_SGM": {
+      "definition": "User who is either SGA or SGM and is currently active",
+      "filter": "(IsSGA__c = TRUE OR Is_SGM__c = TRUE) AND IsActive = TRUE"
+    }
+  },
+  "notes": [
+    "User table is used to enrich Lead and Opportunity records with owner and SGA information",
+    "Lead.OwnerID and Opportunity.OwnerId link to User.Id to get owner details",
+    "Opportunity.SGA__c links to User.Id to get assigned SGA details",
+    "Lead.SGA_Owner_Name__c links to User.Name (by name match) to get assigned SGA details",
+    "Active SGA/SGM users are filtered using: (IsSGA__c = TRUE OR Is_SGM__c = TRUE) AND IsActive = TRUE",
+    "SGM name is derived from Opportunity Owner if opp_owner_user.is_SGM__c = TRUE",
+    "SGA_IsActiveSGA is a derived field indicating if the assigned SGA is an active SGA or SGM"
+  ]
+}
+

@@ -1,3 +1,4 @@
+CREATE OR REPLACE VIEW `savvy-gtm-analytics.savvy_analytics.vw_channel_drill_base` AS
 SELECT
   -- Channel + drill keys
   CASE
@@ -34,8 +35,22 @@ SELECT
   f.converted_date_raw,
   f.Date_Became_SQO__c,
   f.advisor_join_date__c,
-  f.Stage_Entered_Signed__c
+  f.Stage_Entered_Signed__c,
 
-  -- REMOVED: The custom 'status' field is no longer needed
+  -- Disposition for Closed Lost determination
+  f.Disposition__c,
+
+  -- Conversion Status
+  CASE
+    -- Converted: When advisor has become SQO
+    WHEN f.is_sqo = 1 THEN 'Converted'
+    -- Closed Lost: When there's a disposition or StageName is Closed Lost
+    WHEN f.Disposition__c IS NOT NULL OR f.StageName = 'Closed Lost' THEN 'Closed Lost'
+    -- Open: When they have SQL'd but haven't converted to SQO and haven't closed lost
+    WHEN f.is_sql = 1 AND f.is_sqo = 0 
+     AND (f.Disposition__c IS NULL AND (f.StageName IS NULL OR f.StageName != 'Closed Lost'))
+    THEN 'Open'
+    ELSE NULL
+  END AS conversion_status
 
 FROM `savvy-gtm-analytics.savvy_analytics.vw_funnel_lead_to_joined_v2` AS f

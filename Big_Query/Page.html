@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body {
+      font-family: 'Google Sans', Arial, sans-serif;
+      max-width: 500px;
+      margin: 20px auto;
+      padding: 20px;
+      background: #f8f9fa;
+    }
+    .container {
+      background: white;
+      padding: 30px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    h1 {
+      color: #1a73e8;
+      margin-bottom: 20px;
+    }
+    .form-group {
+      margin-bottom: 20px;
+    }
+    label {
+      display: block;
+      margin-bottom: 5px;
+      font-weight: 500;
+      color: #5f6368;
+    }
+    input[type="email"], select {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+      font-size: 14px;
+      box-sizing: border-box;
+    }
+    input[type="email"]:focus, select:focus {
+      outline: none;
+      border-color: #1a73e8;
+      box-shadow: 0 0 0 2px rgba(26,115,232,0.2);
+    }
+    button {
+      background: #1a73e8;
+      color: white;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 4px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      width: 100%;
+      margin-top: 10px;
+    }
+    button:hover {
+      background: #1765cc;
+    }
+    button:disabled {
+      background: #dadce0;
+      cursor: not-allowed;
+    }
+    .status {
+      margin-top: 20px;
+      padding: 10px;
+      border-radius: 4px;
+      display: none;
+    }
+    .status.success {
+      background: #e8f5e9;
+      color: #2e7d32;
+      border: 1px solid #4caf50;
+    }
+    .status.error {
+      background: #ffebee;
+      color: #c62828;
+      border: 1px solid #f44336;
+    }
+    .status.info {
+      background: #e3f2fd;
+      color: #1565c0;
+      border: 1px solid #2196f3;
+    }
+    .loader {
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #1a73e8;
+      border-radius: 50%;
+      width: 30px;
+      height: 30px;
+      animation: spin 1s linear infinite;
+      margin: 20px auto;
+      display: none;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>📊 Capacity Report Generator</h1>
+    <p>Generate and email the latest capacity summary report.</p>
+    
+    <form id="reportForm">
+      <div class="form-group">
+        <label for="email">Email Address *</label>
+        <input type="email" id="email" name="email" required placeholder="your.email@company.com">
+      </div>
+      
+      <div class="form-group">
+        <label for="llm_provider">LLM Provider</label>
+        <select id="llm_provider" name="llm_provider">
+          <option value="gemini" selected>Gemini (Default)</option>
+          <option value="openai">OpenAI</option>
+          <option value="anthropic">Anthropic</option>
+        </select>
+      </div>
+      
+      <div class="form-group">
+        <label>
+          <input type="checkbox" id="generate_pdf" name="generate_pdf" checked>
+          Generate PDF via Gamma.app (beautiful formatted PDF)
+        </label>
+        <small style="color: #666; display: block; margin-top: 5px;">
+          Requires Gamma.app API key and Pro/Ultra/Teams/Business subscription
+        </small>
+      </div>
+      
+      <button type="submit" id="submitBtn">Generate & Send Report</button>
+    </form>
+    
+    <div class="loader" id="loader"></div>
+    <div class="status" id="status"></div>
+  </div>
+
+  <script>
+    document.getElementById('reportForm').addEventListener('submit', function(e) {
+      e.preventDefault();
+      
+      const email = document.getElementById('email').value;
+      const llmProvider = document.getElementById('llm_provider').value;
+      const generatePdf = document.getElementById('generate_pdf').checked;
+      const submitBtn = document.getElementById('submitBtn');
+      const loader = document.getElementById('loader');
+      const status = document.getElementById('status');
+      
+      // Disable button and show loader
+      submitBtn.disabled = true;
+      loader.style.display = 'block';
+      status.style.display = 'none';
+      
+      // Make request to Apps Script
+      google.script.run
+        .withSuccessHandler(function(result) {
+          loader.style.display = 'none';
+          submitBtn.disabled = false;
+          
+          if (result.success) {
+            let message = '✅ Report generated and sent successfully to ' + result.email + '!';
+            if (result.pdfUrl) {
+              message += '<br><br>📄 <a href="' + result.pdfUrl + '" target="_blank" style="color: #1a73e8;">Download PDF Version</a>';
+            }
+            status.className = 'status success';
+            status.innerHTML = message;
+          } else {
+            status.className = 'status error';
+            status.innerHTML = '❌ Error: ' + (result.error || 'Unknown error');
+          }
+          status.style.display = 'block';
+        })
+        .withFailureHandler(function(error) {
+          loader.style.display = 'none';
+          submitBtn.disabled = false;
+          status.className = 'status error';
+          status.innerHTML = '❌ Error: ' + error.message;
+          status.style.display = 'block';
+        })
+        .doPost({
+          parameter: {
+            email: email,
+            llm_provider: llmProvider,
+            generate_pdf: generatePdf ? 'true' : 'false'
+          }
+        });
+    });
+  </script>
+</body>
+</html>
+

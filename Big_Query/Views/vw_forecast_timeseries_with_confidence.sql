@@ -70,7 +70,7 @@ Cumulative_Actuals AS (
     
     -- Also include ALL sources from forecast (even with zero actuals)
     SELECT DISTINCT
-      CASE WHEN Channel = 'Inbound' THEN 'Marketing' ELSE Channel END AS Channel_Grouping_Name,
+      COALESCE(cg.Channel_Grouping_Name, CASE WHEN Channel = 'Inbound' THEN 'Marketing' ELSE Channel END) AS Channel_Grouping_Name,
       original_source AS Original_source,
       CASE
         WHEN LOWER(stage) = 'mql' THEN 'mqls'
@@ -79,7 +79,9 @@ Cumulative_Actuals AS (
         WHEN LOWER(stage) = 'joined' THEN 'joined'
         ELSE LOWER(stage)
       END AS stage
-    FROM `savvy-gtm-analytics.SavvyGTMData.q4_2025_forecast`
+    FROM `savvy-gtm-analytics.SavvyGTMData.q4_2025_forecast` f
+    LEFT JOIN `savvy-gtm-analytics.SavvyGTMData.Channel_Group_Mapping` cg
+      ON f.original_source = cg.Original_Source_Salesforce
     WHERE metric = 'Cohort_source'
       AND original_source != 'All'
       AND month_key IN ('2025-10', '2025-11', '2025-12')
@@ -95,7 +97,7 @@ Cumulative_Actuals AS (
 -- 5. Get MONTHLY forecast targets for stepped progression (WITH DEDUPLICATION)
 Monthly_Forecast_Targets AS (
   SELECT
-    CASE WHEN Channel = 'Inbound' THEN 'Marketing' ELSE Channel END AS channel_grouping_name,
+    COALESCE(cg.Channel_Grouping_Name, CASE WHEN Channel = 'Inbound' THEN 'Marketing' ELSE Channel END) AS channel_grouping_name,
     original_source,
     CASE
       WHEN LOWER(stage) = 'mql' THEN 'mqls'
@@ -105,7 +107,9 @@ Monthly_Forecast_Targets AS (
     END AS stage,
     month_key,
     SUM(CAST(forecast_value AS INT64)) AS monthly_forecast  -- SUM to handle duplicates
-  FROM `savvy-gtm-analytics.SavvyGTMData.q4_2025_forecast`
+  FROM `savvy-gtm-analytics.SavvyGTMData.q4_2025_forecast` f
+  LEFT JOIN `savvy-gtm-analytics.SavvyGTMData.Channel_Group_Mapping` cg
+    ON f.original_source = cg.Original_Source_Salesforce
   WHERE metric = 'Cohort_source'
     AND original_source != 'All'
     AND month_key IN ('2025-10', '2025-11', '2025-12')

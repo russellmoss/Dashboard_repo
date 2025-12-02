@@ -3,61 +3,71 @@
 -- Allows for single table in Looker Studio instead of multiple scorecards
 
 WITH
+Source_Channel_Map AS (
+  SELECT
+    Original_Source_Salesforce AS original_source,
+    Channel_Grouping_Name
+  FROM `savvy-gtm-analytics.SavvyGTMData.Channel_Group_Mapping`
+),
 -- 1. Actual data aggregated by original source and date
 -- Use separate queries for each metric to ensure proper date attribution
+-- NOTE: No date restriction on actuals - show all available actual data regardless of forecast range
 Actual_Data AS (
   -- SQL data
   SELECT
-    COALESCE(Channel_Grouping_Name, 'Other') AS Channel_Grouping_Name,
-    COALESCE(Original_source, 'Unknown') AS Original_source,
+    COALESCE(map.Channel_Grouping_Name, COALESCE(v.Channel_Grouping_Name, 'Other')) AS Channel_Grouping_Name,
+    COALESCE(v.Original_source, 'Unknown') AS Original_source,
     DATE(converted_date_raw) AS date_day,
     COUNT(CASE WHEN is_sql = 1 THEN 1 END) AS sql_actual,
     0 AS sqo_actual,
     0 AS joined_actual,
     0 AS aum_actual
-  FROM `savvy-gtm-analytics.savvy_analytics.vw_funnel_lead_to_joined_v2`
+  FROM `savvy-gtm-analytics.savvy_analytics.vw_funnel_lead_to_joined_v2` v
+  LEFT JOIN Source_Channel_Map map
+    ON v.Original_source = map.original_source
   WHERE converted_date_raw IS NOT NULL
-    AND DATE(converted_date_raw) BETWEEN '2025-10-01' AND '2025-12-31'
   GROUP BY 1, 2, 3
   
   UNION ALL
   
   -- SQO data (use Date_Became_SQO__c as the date)
   SELECT
-    COALESCE(Channel_Grouping_Name, 'Other') AS Channel_Grouping_Name,
-    COALESCE(Original_source, 'Unknown') AS Original_source,
+    COALESCE(map.Channel_Grouping_Name, COALESCE(v.Channel_Grouping_Name, 'Other')) AS Channel_Grouping_Name,
+    COALESCE(v.Original_source, 'Unknown') AS Original_source,
     DATE(Date_Became_SQO__c) AS date_day,
     0 AS sql_actual,
     COUNT(CASE WHEN is_sqo = 1 THEN 1 END) AS sqo_actual,
     0 AS joined_actual,
     0 AS aum_actual
-  FROM `savvy-gtm-analytics.savvy_analytics.vw_funnel_lead_to_joined_v2`
+  FROM `savvy-gtm-analytics.savvy_analytics.vw_funnel_lead_to_joined_v2` v
+  LEFT JOIN Source_Channel_Map map
+    ON v.Original_source = map.original_source
   WHERE Date_Became_SQO__c IS NOT NULL
-    AND DATE(Date_Became_SQO__c) BETWEEN '2025-10-01' AND '2025-12-31'
   GROUP BY 1, 2, 3
   
   UNION ALL
   
   -- Joined data (use advisor_join_date__c as the date)
   SELECT
-    COALESCE(Channel_Grouping_Name, 'Other') AS Channel_Grouping_Name,
-    COALESCE(Original_source, 'Unknown') AS Original_source,
+    COALESCE(map.Channel_Grouping_Name, COALESCE(v.Channel_Grouping_Name, 'Other')) AS Channel_Grouping_Name,
+    COALESCE(v.Original_source, 'Unknown') AS Original_source,
     DATE(advisor_join_date__c) AS date_day,
     0 AS sql_actual,
     0 AS sqo_actual,
     COUNT(CASE WHEN is_joined = 1 THEN 1 END) AS joined_actual,
     0 AS aum_actual
-  FROM `savvy-gtm-analytics.savvy_analytics.vw_funnel_lead_to_joined_v2`
+  FROM `savvy-gtm-analytics.savvy_analytics.vw_funnel_lead_to_joined_v2` v
+  LEFT JOIN Source_Channel_Map map
+    ON v.Original_source = map.original_source
   WHERE advisor_join_date__c IS NOT NULL
-    AND DATE(advisor_join_date__c) BETWEEN '2025-10-01' AND '2025-12-31'
   GROUP BY 1, 2, 3
   
   UNION ALL
   
   -- AUM data (use Stage_Entered_Signed__c as the date)
   SELECT
-    COALESCE(Channel_Grouping_Name, 'Other') AS Channel_Grouping_Name,
-    COALESCE(Original_source, 'Unknown') AS Original_source,
+    COALESCE(map.Channel_Grouping_Name, COALESCE(v.Channel_Grouping_Name, 'Other')) AS Channel_Grouping_Name,
+    COALESCE(v.Original_source, 'Unknown') AS Original_source,
     DATE(Stage_Entered_Signed__c) AS date_day,
     0 AS sql_actual,
     0 AS sqo_actual,
@@ -67,9 +77,10 @@ Actual_Data AS (
       THEN Opportunity_AUM 
       ELSE 0 
     END) AS aum_actual
-  FROM `savvy-gtm-analytics.savvy_analytics.vw_funnel_lead_to_joined_v2`
+  FROM `savvy-gtm-analytics.savvy_analytics.vw_funnel_lead_to_joined_v2` v
+  LEFT JOIN Source_Channel_Map map
+    ON v.Original_source = map.original_source
   WHERE Stage_Entered_Signed__c IS NOT NULL
-    AND DATE(Stage_Entered_Signed__c) BETWEEN '2025-10-01' AND '2025-12-31'
   GROUP BY 1, 2, 3
 ),
 
@@ -100,10 +111,16 @@ Forecast_Data AS (
   FROM `savvy-gtm-analytics.savvy_analytics.vw_daily_forecast`
 ),
 
--- 4. Generate date spine for the full period
+-- 4. Generate date spine dynamically from actual data dates + forecast dates
+-- This ensures we have rows for any date with actual data, even outside the forecast range
 Date_Spine AS (
-  SELECT date_day
-  FROM UNNEST(GENERATE_DATE_ARRAY('2025-10-01', '2025-12-31', INTERVAL 1 DAY)) AS date_day
+  SELECT DISTINCT date_day
+  FROM Actual_Aggregated
+  
+  UNION DISTINCT
+  
+  SELECT DISTINCT date_day
+  FROM Forecast_Data
 ),
 
 -- 5. Get all unique channel/source combinations
@@ -197,3 +214,4 @@ LEFT JOIN Forecast_Data forecast
   AND f.Original_source = forecast.Original_source
 
 ORDER BY f.date_day, f.Channel_Grouping_Name, f.Original_source
+

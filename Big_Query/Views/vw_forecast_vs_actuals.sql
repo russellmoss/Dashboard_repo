@@ -31,7 +31,7 @@ Funnel_Unfiltered AS (
 Forecast_Data AS (
   SELECT
     month_key,
-    CASE WHEN Channel = 'Inbound' THEN 'Marketing' ELSE Channel END AS channel_grouping_name,
+    COALESCE(cg.Channel_Grouping_Name, CASE WHEN Channel = 'Inbound' THEN 'Marketing' ELSE Channel END) AS channel_grouping_name,
     original_source,
     metric,
     CASE
@@ -41,7 +41,9 @@ Forecast_Data AS (
       ELSE LOWER(stage)
     END AS stage,
     CAST(forecast_value AS INT64) AS forecast_value
-  FROM `savvy-gtm-analytics.SavvyGTMData.q4_2025_forecast`
+  FROM `savvy-gtm-analytics.SavvyGTMData.q4_2025_forecast` f
+  LEFT JOIN `savvy-gtm-analytics.SavvyGTMData.Channel_Group_Mapping` cg
+    ON f.original_source = cg.Original_Source_Salesforce
   WHERE metric = 'Cohort_source'
     AND original_source != 'All'
 ),
@@ -114,9 +116,21 @@ Daily_Segments AS (
     COUNT(DISTINCT IF(is_contacted = 1 AND is_mql = 1, Full_prospect_id__c, NULL)) AS num_c2m,
     COUNT(DISTINCT IF(is_mql = 1, Full_prospect_id__c, NULL)) AS den_mql,
     COUNT(DISTINCT IF(is_mql = 1 AND is_sql = 1, Full_prospect_id__c, NULL)) AS num_m2s,
-    COUNT(DISTINCT CASE WHEN is_sql = 1 AND Full_Opportunity_ID__c IS NOT NULL THEN Full_Opportunity_ID__c END) AS den_sql_opp,
+    -- THIS IS THE NEW (CORRECTED) DENOMINATOR:
+    COUNT(DISTINCT CASE 
+                 WHEN is_sql = 1 
+                  AND (SQL_conversion_status = 'Converted' OR SQL_conversion_status = 'Closed')
+                  AND Full_Opportunity_ID__c IS NOT NULL 
+                 THEN Full_Opportunity_ID__c 
+               END) AS den_sql_opp,
     COUNT(DISTINCT CASE WHEN is_sql = 1 AND is_sqo = 1 AND Full_Opportunity_ID__c IS NOT NULL THEN Full_Opportunity_ID__c END) AS num_s2q,
-    COUNT(DISTINCT CASE WHEN is_sqo = 1 AND Full_Opportunity_ID__c IS NOT NULL THEN Full_Opportunity_ID__c END) AS den_sqo_opp,
+    -- UPDATED: Only include SQOs with final outcome (joined or closed lost) - excludes open SQOs
+    COUNT(DISTINCT CASE 
+      WHEN is_sqo = 1 
+        AND Full_Opportunity_ID__c IS NOT NULL
+        AND (is_joined = 1 OR StageName = 'Closed Lost')
+      THEN Full_Opportunity_ID__c 
+    END) AS den_sqo_opp,
     COUNT(DISTINCT CASE WHEN is_joined = 1 AND Full_Opportunity_ID__c IS NOT NULL THEN Full_Opportunity_ID__c END) AS num_q2j
   FROM Funnel_With_Flags
   WHERE DATE(FilterDate) BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY) AND CURRENT_DATE()

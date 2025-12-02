@@ -1,0 +1,17 @@
+# Core dependencies
+google-cloud-bigquery>=3.0.0
+google-auth>=2.0.0
+pandas>=1.5.0
+
+# LLM Providers (install only what you need)
+openai>=1.0.0  # For OpenAI
+anthropic>=0.18.0  # For Anthropic Claude
+google-generativeai>=0.3.0  # For Google Gemini
+
+# Optional: Email and formatting
+markdown>=3.4.0  # For markdown to HTML conversion
+requests>=2.28.0  # For Gamma.app API calls
+
+# Optional: For Cloud Function deployment
+flask>=2.3.0  # Only needed for local testing of cloud function
+gunicorn>=20.1.0  # For Cloud Function deployment

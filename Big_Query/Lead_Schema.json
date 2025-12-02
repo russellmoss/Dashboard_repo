@@ -1,0 +1,218 @@
+{
+  "table_name": "Lead",
+  "full_table_path": "savvy-gtm-analytics.SavvyGTMData.Lead",
+  "description": "Salesforce Lead object containing prospect/lead information. Leads can convert to Opportunities. Used to track pre-SQO funnel stages (Contacted, MQL, SQL).",
+  "relationships": {
+    "converts_to_opportunity": {
+      "relationship_type": "one_to_one",
+      "related_table": "Opportunity",
+      "join_key_lead": "ConvertedOpportunityId",
+      "join_key_opportunity": "Id",
+      "description": "When IsConverted = TRUE, Lead.ConvertedOpportunityId links to Opportunity.Id"
+    },
+    "owned_by_user": {
+      "relationship_type": "many_to_one",
+      "related_table": "User",
+      "join_key_lead": "OwnerID",
+      "join_key_user": "Id",
+      "description": "Lead.OwnerID links to User.Id to identify the owner of the lead record"
+    },
+    "assigned_sga": {
+      "relationship_type": "many_to_one",
+      "related_table": "User",
+      "join_key_lead": "SGA_Owner_Name__c",
+      "join_key_user": "Name",
+      "description": "SGA_Owner_Name__c contains the name of the assigned SGA (Sales Growth Advisor), can be joined to User.Name"
+    }
+  },
+  "key_fields": {
+    "Id": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Salesforce unique identifier for Lead record",
+      "usage_in_codebase": "Primary key, used in joins"
+    },
+    "Full_prospect_id__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Custom unique identifier for prospect/lead. Used as primary key in analytics views.",
+      "usage_in_codebase": "Primary identifier in vw_funnel_lead_to_joined_v2, used as primary_key when lead exists"
+    },
+    "IsConverted": {
+      "data_type": "BOOL",
+      "nullable": true,
+      "description": "Indicates if Lead has been converted to an Opportunity. When TRUE, the lead is considered an SQL (Sales Qualified Lead).",
+      "usage_in_codebase": "Used to calculate is_sql flag: CASE WHEN IsConverted IS TRUE THEN 1 ELSE 0 END"
+    },
+    "ConvertedDate": {
+      "data_type": "DATE",
+      "nullable": true,
+      "description": "Date when Lead was converted to Opportunity. This is the SQL date (when lead became SQL).",
+      "usage_in_codebase": "Used as converted_date_raw and for SQL date attribution in conversion rate calculations"
+    },
+    "ConvertedOpportunityId": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "ID of the Opportunity created when Lead was converted. Links to Opportunity.Id.",
+      "usage_in_codebase": "Used to join Lead to Opportunity: l.converted_oppty_id = o.Full_Opportunity_ID__c"
+    },
+    "OwnerID": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "ID of the User who owns the Lead record. Links to User.Id.",
+      "usage_in_codebase": "Joined to User table: l.OwnerID = lead_owner.Id to get Lead Owner information"
+    },
+    "SGA_Owner_Name__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Name of the assigned SGA (Sales Growth Advisor). Can be 'Savvy Marketing' for marketing-sourced leads.",
+      "usage_in_codebase": "Used for SGA attribution. If 'Savvy Marketing', falls back to Opportunity SGA. Used to join to User.Name for SGA user details."
+    },
+    "Disposition__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Disposition/reason when Lead is closed. Values include: 'Auto-Closed by Operations', 'No Response', 'Not Interested in Moving', 'Not a Fit', etc. When NOT NULL, indicates Lead is closed.",
+      "usage_in_codebase": "Used to determine if Lead is closed: WHEN Disposition__c IS NOT NULL THEN 'Closed'"
+    },
+    "LeadSource": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Original source of the Lead (e.g., 'LinkedIn', 'Advisor Referral', 'Ashby', 'Dover', etc.).",
+      "usage_in_codebase": "Used as Lead_Original_Source, mapped to Channel_Grouping_Name via Channel_Group_Mapping table"
+    },
+    "Status": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Current status of the Lead in Salesforce",
+      "usage_in_codebase": "Included in views but not heavily used in calculations"
+    }
+  },
+  "funnel_stage_fields": {
+    "stage_entered_new__c": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Lead entered 'New' stage",
+      "usage_in_codebase": "Used in FilterDate calculation: GREATEST(CreatedDate, stage_entered_new__c, stage_entered_contacting__c)"
+    },
+    "stage_entered_contacting__c": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Lead entered 'Contacting' stage. Marks the 'Contacted' funnel stage.",
+      "usage_in_codebase": "Used to calculate is_contacted: CASE WHEN stage_entered_contacting__c IS NOT NULL THEN 1 ELSE 0 END"
+    },
+    "Stage_Entered_Call_Scheduled__c": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Lead entered 'Call Scheduled' stage. Marks the MQL (Marketing Qualified Lead) funnel stage.",
+      "usage_in_codebase": "Used to calculate is_mql: CASE WHEN Stage_Entered_Call_Scheduled__c IS NOT NULL THEN 1 ELSE 0 END. Aliased as mql_stage_entered_ts."
+    },
+    "Initial_Call_Scheduled_Date__c": {
+      "data_type": "DATE",
+      "nullable": true,
+      "description": "Date when initial call was scheduled",
+      "usage_in_codebase": "Used to calculate is_initial_call flag and for week bucketing"
+    },
+    "Stage_Entered_Closed__c": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Lead entered 'Closed' stage",
+      "usage_in_codebase": "Available but not heavily used in current views"
+    }
+  },
+  "custom_fields": {
+    "lead_list_name__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Name of the lead list the Lead came from",
+      "usage_in_codebase": "Included in views for filtering/grouping"
+    },
+    "Experimentation_Tag__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Tag for experiment tracking",
+      "usage_in_codebase": "Used in experimentation analysis views"
+    },
+    "External_Agency__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "External agency name if lead came from external source",
+      "usage_in_codebase": "Included in views for source attribution"
+    },
+    "Company": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Company name of the lead",
+      "usage_in_codebase": "Included in views"
+    },
+    "Email": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Email address of the lead",
+      "usage_in_codebase": "Available but not heavily used in analytics views"
+    },
+    "Phone": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Phone number of the lead",
+      "usage_in_codebase": "Available but not heavily used in analytics views"
+    }
+  },
+  "standard_salesforce_fields": {
+    "CreatedDate": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Lead record was created in Salesforce",
+      "usage_in_codebase": "Used in FilterDate calculation and for date attribution"
+    },
+    "LastModifiedDate": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Lead record was last modified",
+      "usage_in_codebase": "Available but not used in current analytics views"
+    },
+    "Name": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Full name of the lead (FirstName + LastName)",
+      "usage_in_codebase": "Aliased as Prospect_Name in views"
+    },
+    "FirstName": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "First name of the lead",
+      "usage_in_codebase": "Included in views"
+    },
+    "LastName": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Last name of the lead",
+      "usage_in_codebase": "Included in views"
+    }
+  },
+  "funnel_stage_definitions": {
+    "Contacted": {
+      "field": "stage_entered_contacting__c",
+      "definition": "Lead entered 'Contacting' stage",
+      "flag": "is_contacted = 1 when stage_entered_contacting__c IS NOT NULL"
+    },
+    "MQL": {
+      "field": "Stage_Entered_Call_Scheduled__c",
+      "definition": "Lead scheduled a call (Marketing Qualified Lead)",
+      "flag": "is_mql = 1 when Stage_Entered_Call_Scheduled__c IS NOT NULL"
+    },
+    "SQL": {
+      "field": "IsConverted",
+      "definition": "Lead converted to Opportunity (Sales Qualified Lead)",
+      "flag": "is_sql = 1 when IsConverted = TRUE",
+      "date_field": "ConvertedDate"
+    }
+  },
+  "notes": [
+    "Lead is the primary object for tracking pre-SQO funnel stages",
+    "SQL status is determined by IsConverted = TRUE, not by Opportunity stage",
+    "Some Opportunities exist without corresponding Lead records (opportunity-only records)",
+    "Full_prospect_id__c is the preferred unique identifier for analytics",
+    "SGA_Owner_Name__c can be 'Savvy Marketing' which triggers fallback to Opportunity SGA"
+  ]
+}
+

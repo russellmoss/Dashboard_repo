@@ -1,0 +1,315 @@
+{
+  "table_name": "Opportunity",
+  "full_table_path": "savvy-gtm-analytics.SavvyGTMData.Opportunity",
+  "description": "Salesforce Opportunity object containing opportunity information. Tracks post-SQL funnel stages (SQO, Qualifying, Discovery, Sales Process, Negotiating, Signed, Joined). Only opportunities with recordtypeid = '012Dn000000mrO3IAI' are used in analytics.",
+  "filter": {
+    "recordtypeid": "012Dn000000mrO3IAI",
+    "description": "Only opportunities with this record type ID are included in analytics views (likely 'Advisor' or 'FA' record type)"
+  },
+  "relationships": {
+    "converted_from_lead": {
+      "relationship_type": "one_to_one",
+      "related_table": "Lead",
+      "join_key_opportunity": "Id",
+      "join_key_lead": "ConvertedOpportunityId",
+      "description": "When Lead.IsConverted = TRUE, Lead.ConvertedOpportunityId = Opportunity.Id. Some opportunities exist without corresponding Lead records."
+    },
+    "owned_by_user": {
+      "relationship_type": "many_to_one",
+      "related_table": "User",
+      "join_key_opportunity": "OwnerId",
+      "join_key_user": "Id",
+      "description": "Opportunity.OwnerId links to User.Id to identify the owner of the opportunity record"
+    },
+    "assigned_sga": {
+      "relationship_type": "many_to_one",
+      "related_table": "User",
+      "join_key_opportunity": "SGA__c",
+      "join_key_user": "Id",
+      "description": "Opportunity.SGA__c links to User.Id to identify the assigned SGA (Sales Growth Advisor)"
+    }
+  },
+  "key_fields": {
+    "Id": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Salesforce unique identifier for Opportunity record",
+      "usage_in_codebase": "Primary key, used in joins with Lead.ConvertedOpportunityId"
+    },
+    "Full_Opportunity_ID__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Custom unique identifier for opportunity. Used as primary key in analytics views.",
+      "usage_in_codebase": "Primary identifier in vw_funnel_lead_to_joined_v2, used as primary_key when no lead exists"
+    },
+    "StageName": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Current sales stage of the Opportunity. Values include: 'Qualifying', 'Discovery', 'Sales Process', 'Negotiating', 'Signed', 'Joined', 'Closed Lost', 'On Hold', 'Closed'.",
+      "usage_in_codebase": "Used to determine opportunity status and conversion outcomes. 'Closed Lost' indicates closed opportunity."
+    },
+    "SQL__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Sales Qualified Opportunity (SQO) indicator. Values: 'Yes' (is SQO), 'No' (not SQO), or NULL (not yet evaluated). Business-approved definition for SQO status.",
+      "usage_in_codebase": "Used to calculate is_sqo flag: CASE WHEN LOWER(SQL__c) = 'yes' THEN 1 ELSE 0 END. Aliased as SQO_raw in views."
+    },
+    "Date_Became_SQO__c": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Opportunity became an SQO (when SQL__c was set to 'Yes'). This is the SQO conversion date.",
+      "usage_in_codebase": "Used for SQO date attribution and conversion rate calculations. Also marks 'Qualifying' stage entry."
+    },
+    "advisor_join_date__c": {
+      "data_type": "DATE",
+      "nullable": true,
+      "description": "Date when advisor actually joined Savvy. This is the final conversion outcome (Joined stage).",
+      "usage_in_codebase": "Used to calculate is_joined flag and for joined volume metrics. Used as fallback in FilterDate calculation."
+    },
+    "OwnerId": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "ID of the User who owns the Opportunity record. Links to User.Id.",
+      "usage_in_codebase": "Joined to User table: o.OwnerId = opp_owner_user.Id to get Opportunity Owner information"
+    },
+    "SGA__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "ID of the assigned SGA (Sales Growth Advisor). Links to User.Id.",
+      "usage_in_codebase": "Joined to User table: o.SGA__c = sga_user.Id to get SGA name (sga_name_from_opp)"
+    },
+    "LeadSource": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Original source of the Opportunity (e.g., 'LinkedIn', 'Advisor Referral', 'Ashby', etc.). May differ from Lead.LeadSource if opportunity was created separately.",
+      "usage_in_codebase": "Used as Opp_Original_Source, with fallback to Lead.LeadSource: COALESCE(o.Opp_Original_Source, l.Lead_Original_Source)"
+    },
+    "IsClosed": {
+      "data_type": "BOOL",
+      "nullable": true,
+      "description": "Indicates if Opportunity is closed (won or lost)",
+      "usage_in_codebase": "Included in views but not heavily used in calculations"
+    },
+    "CloseDate": {
+      "data_type": "DATE",
+      "nullable": true,
+      "description": "Expected or actual close date of the Opportunity",
+      "usage_in_codebase": "Included in views"
+    }
+  },
+  "stage_entry_fields": {
+    "Stage_Entered_Discovery__c": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Opportunity entered 'Discovery' stage",
+      "usage_in_codebase": "Used for Discovery volume metrics and conversion rate calculations"
+    },
+    "Stage_Entered_Sales_Process__c": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Opportunity entered 'Sales Process' stage",
+      "usage_in_codebase": "Used for Sales Process volume metrics and conversion rate calculations"
+    },
+    "Stage_Entered_Negotiating__c": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Opportunity entered 'Negotiating' stage",
+      "usage_in_codebase": "Used for Negotiating volume metrics and conversion rate calculations"
+    },
+    "Stage_Entered_Signed__c": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Opportunity entered 'Signed' stage",
+      "usage_in_codebase": "Used for Signed volume metrics and conversion rate calculations"
+    },
+    "Stage_Entered_Joined__c": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Opportunity entered 'Joined' stage",
+      "usage_in_codebase": "Included in views"
+    },
+    "Stage_Entered_On_Hold__c": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Opportunity entered 'On Hold' stage",
+      "usage_in_codebase": "Available but not heavily used"
+    },
+    "Stage_Entered_Closed__c": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Opportunity entered 'Closed' stage",
+      "usage_in_codebase": "Available but not heavily used"
+    }
+  },
+  "outcome_fields": {
+    "Closed_Lost_Reason__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Reason why Opportunity was closed lost",
+      "usage_in_codebase": "Included in views for analysis"
+    },
+    "Closed_Lost_Details__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Additional details about why Opportunity was closed lost",
+      "usage_in_codebase": "Included in views for analysis"
+    }
+  },
+  "financial_fields": {
+    "Amount": {
+      "data_type": "FLOAT64",
+      "nullable": true,
+      "description": "Opportunity amount in dollars",
+      "usage_in_codebase": "Included in views"
+    },
+    "Underwritten_AUM__c": {
+      "data_type": "FLOAT64",
+      "nullable": true,
+      "description": "Underwritten Assets Under Management",
+      "usage_in_codebase": "Used to calculate Opportunity_AUM_M (in millions) for filtering in conversion rates"
+    }
+  },
+  "qualification_fields": {
+    "Qualification_Call_Date__c": {
+      "data_type": "DATE",
+      "nullable": true,
+      "description": "Date of qualification call",
+      "usage_in_codebase": "Included in views"
+    },
+    "Firm_Name__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Name of the firm",
+      "usage_in_codebase": "Included in views"
+    },
+    "Firm_Type__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Type of firm",
+      "usage_in_codebase": "Included in views"
+    },
+    "City_State__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "City and state",
+      "usage_in_codebase": "Included in views"
+    },
+    "Office_Address__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Office address",
+      "usage_in_codebase": "Included in views"
+    }
+  },
+  "custom_fields": {
+    "External_Agency__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "External agency name if opportunity came from external source",
+      "usage_in_codebase": "Included in views for source attribution"
+    },
+    "Opportunity_Owner_Name__c": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Name of the opportunity owner (formula field)",
+      "usage_in_codebase": "Included in views"
+    },
+    "Earliest_Anticipated_Start_Date__c": {
+      "data_type": "DATE",
+      "nullable": true,
+      "description": "Earliest anticipated start date for the advisor",
+      "usage_in_codebase": "Included in views"
+    },
+    "NextStep": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Next step in the sales process",
+      "usage_in_codebase": "Included in views"
+    }
+  },
+  "standard_salesforce_fields": {
+    "CreatedDate": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Opportunity record was created in Salesforce",
+      "usage_in_codebase": "Used as Opp_CreatedDate and as fallback in FilterDate calculation"
+    },
+    "LastModifiedDate": {
+      "data_type": "TIMESTAMP",
+      "nullable": true,
+      "description": "Timestamp when Opportunity record was last modified",
+      "usage_in_codebase": "Available but not used in current analytics views"
+    },
+    "LastActivityDate": {
+      "data_type": "DATE",
+      "nullable": true,
+      "description": "Date of last activity on the Opportunity. 93.5% of opportunities have this field populated.",
+      "usage_in_codebase": "Available but NOT currently used in any analytics views"
+    },
+    "Name": {
+      "data_type": "STRING",
+      "nullable": true,
+      "description": "Name of the Opportunity",
+      "usage_in_codebase": "Aliased as Opp_Name in views"
+    }
+  },
+  "funnel_stage_definitions": {
+    "SQO": {
+      "field": "SQL__c",
+      "definition": "Sales Qualified Opportunity - business-approved qualification",
+      "flag": "is_sqo = 1 when SQL__c = 'Yes'",
+      "date_field": "Date_Became_SQO__c"
+    },
+    "Qualifying": {
+      "field": "Date_Became_SQO__c",
+      "definition": "Entry point for SQO opportunities (no separate entry field, uses Date_Became_SQO__c)",
+      "date_field": "Date_Became_SQO__c"
+    },
+    "Discovery": {
+      "field": "Stage_Entered_Discovery__c",
+      "definition": "Opportunity entered Discovery stage",
+      "date_field": "Stage_Entered_Discovery__c"
+    },
+    "Sales Process": {
+      "field": "Stage_Entered_Sales_Process__c",
+      "definition": "Opportunity entered Sales Process stage",
+      "date_field": "Stage_Entered_Sales_Process__c"
+    },
+    "Negotiating": {
+      "field": "Stage_Entered_Negotiating__c",
+      "definition": "Opportunity entered Negotiating stage",
+      "date_field": "Stage_Entered_Negotiating__c"
+    },
+    "Signed": {
+      "field": "Stage_Entered_Signed__c",
+      "definition": "Opportunity entered Signed stage",
+      "date_field": "Stage_Entered_Signed__c"
+    },
+    "Joined": {
+      "field": "advisor_join_date__c",
+      "definition": "Advisor actually joined Savvy (final conversion outcome)",
+      "date_field": "advisor_join_date__c"
+    }
+  },
+  "stage_name_values": [
+    "Qualifying",
+    "Discovery",
+    "Sales Process",
+    "Negotiating",
+    "Signed",
+    "Joined",
+    "On Hold",
+    "Closed Lost",
+    "Closed"
+  ],
+  "notes": [
+    "Only opportunities with recordtypeid = '012Dn000000mrO3IAI' are included in analytics",
+    "SQL__c = 'Yes' is the business-approved definition for SQO status",
+    "Some opportunities exist without corresponding Lead records (opportunity-only records)",
+    "Full_Opportunity_ID__c is the preferred unique identifier for analytics",
+    "StageName = 'Closed Lost' indicates a closed/lost opportunity",
+    "advisor_join_date__c is the final conversion outcome (Joined stage)",
+    "LastActivityDate exists and is 93.5% populated but is NOT currently used in analytics views"
+  ]
+}
+

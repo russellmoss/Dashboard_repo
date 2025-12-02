@@ -1,0 +1,771 @@
+﻿-- Provides capacity planning metrics including:
+-- - Quarterly Margin AUM target: $36,750,000 per SGM
+-- - Required SQOs based on average Margin AUM per SQO
+-- - Required Joined based on average Margin AUM per Joined
+-- - Current pipeline analysis
+-- - Gap analysis and pipeline sufficiency indicators
+-- UPDATED: V2 Logic - Dynamic Valuation, Deal-Size Dependent Stale Logic, Stale Decay
+-- UPDATED: Removed "New Deal Penalty" (data shows young deals <180 days have higher win rate)
+-- UPDATED: Added "Stale Decay" (0.80x) for deals >180 days but still active
+
+WITH Dynamic_Valuation_Params AS (
+  SELECT 
+    COALESCE(AVG(SAFE_DIVIDE(Underwritten_AUM__c, Margin_AUM__c)), 3.30) AS dyn_und_div,
+    COALESCE(AVG(SAFE_DIVIDE(Amount, Margin_AUM__c)), 3.80) AS dyn_amt_div
+  FROM `savvy-gtm-analytics.SavvyGTMData.Opportunity`
+  WHERE StageName = 'Joined' 
+    AND Margin_AUM__c > 0
+    AND advisor_join_date__c >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+),
+
+Active_SGMs AS (
+  SELECT DISTINCT
+    u.Name AS sgm_name,
+    u.Id AS sgm_user_id,
+    u.Is_SGM__c,
+    u.IsActive
+  FROM `savvy-gtm-analytics.SavvyGTMData.User` u
+  WHERE u.Is_SGM__c = TRUE 
+    AND u.IsActive = TRUE
+    AND u.Name NOT IN ('Savvy Marketing', 'Savvy Operations')
+),
+
+Current_Date_Context AS (
+  SELECT
+    CURRENT_DATE() AS current_date,
+    DATE_TRUNC(CURRENT_DATE(), QUARTER) AS current_quarter_start,
+    DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY) AS trailing_365_days_start
+),
+
+Opp_Base AS (
+  SELECT
+    o.Full_Opportunity_ID__c,
+    o.CreatedDate AS Opp_CreatedDate,
+    o.Underwritten_AUM__c,
+    o.Margin_AUM__c,
+    o.Amount,
+    o.StageName,
+    o.Date_Became_SQO__c,
+    o.Stage_Entered_Signed__c,
+    o.advisor_join_date__c,
+    o.SQL__c AS SQO_raw,
+    o.IsClosed,
+    o.CloseDate,
+    CASE WHEN opp_owner_user.Is_SGM__c = TRUE THEN opp_owner_user.Name ELSE NULL END AS sgm_name,
+    opp_owner_user.Id AS sgm_user_id,
+    COALESCE(o.Underwritten_AUM__c, o.Amount) AS Opportunity_AUM,
+    -- Estimated Margin_AUM__c using V2 dynamic fallback logic:
+    CASE
+      WHEN o.Margin_AUM__c IS NOT NULL AND o.Margin_AUM__c > 0 THEN o.Margin_AUM__c / 1000000
+      WHEN o.Underwritten_AUM__c IS NOT NULL AND o.Underwritten_AUM__c > 0 THEN (o.Underwritten_AUM__c / vp.dyn_und_div) / 1000000
+      WHEN o.Amount IS NOT NULL AND o.Amount > 0 THEN (o.Amount / vp.dyn_amt_div) / 1000000
+      ELSE 0
+    END AS estimated_margin_aum,
+    CASE WHEN LOWER(o.SQL__c) = 'yes' THEN 1 ELSE 0 END AS is_sqo,
+    CASE WHEN o.advisor_join_date__c IS NOT NULL THEN 1 ELSE 0 END AS is_joined,
+    CASE WHEN o.StageName = 'Signed' THEN 1 ELSE 0 END AS is_signed,
+    DATE_TRUNC(DATE(o.Date_Became_SQO__c), QUARTER) AS sqo_quarter,
+    DATE_TRUNC(DATE(o.advisor_join_date__c), QUARTER) AS joined_quarter,
+    -- Pipeline status:
+    CASE 
+      WHEN o.IsClosed = FALSE 
+        AND o.advisor_join_date__c IS NULL 
+        AND o.StageName != 'Closed Lost'
+        AND o.StageName != 'On Hold'
+        AND o.StageName IS NOT NULL
+      THEN 1 
+      ELSE 0 
+    END AS is_in_pipeline,
+    -- Stage probability
+    COALESCE(cr.probability_to_join, 0) AS stage_probability,
+    -- SQO age in days
+    CASE 
+      WHEN LOWER(o.SQL__c) = 'yes' AND o.Date_Became_SQO__c IS NOT NULL
+      THEN DATE_DIFF(c.current_date, DATE(o.Date_Became_SQO__c), DAY)
+      ELSE NULL
+    END AS sqo_age_days
+  FROM `savvy-gtm-analytics.SavvyGTMData.Opportunity` o
+  LEFT JOIN `savvy-gtm-analytics.SavvyGTMData.User` opp_owner_user
+    ON o.OwnerId = opp_owner_user.Id
+  LEFT JOIN `savvy-gtm-analytics.savvy_analytics.vw_stage_to_joined_probability` cr
+    ON o.StageName = cr.StageName
+  CROSS JOIN Current_Date_Context c
+  CROSS JOIN Dynamic_Valuation_Params vp
+  WHERE o.recordtypeid = '012Dn000000mrO3IAI'
+    AND opp_owner_user.Is_SGM__c = TRUE
+    AND opp_owner_user.IsActive = TRUE
+),
+
+-- Historical averages and conversion rates per SGM
+SGM_Historical_Metrics AS (
+  SELECT
+    o.sgm_name,
+    -- Avg Margin AUM per SQO (historical, trailing 365 days)
+    CASE 
+      WHEN COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1 
+        AND DATE(o.Date_Became_SQO__c) >= c.trailing_365_days_start
+        THEN o.Full_Opportunity_ID__c 
+      END) > 0
+      THEN (SUM(CASE 
+        WHEN o.is_sqo = 1 
+        AND DATE(o.Date_Became_SQO__c) >= c.trailing_365_days_start
+        THEN o.Margin_AUM__c ELSE 0 
+      END) / 1000000) / COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1 
+        AND DATE(o.Date_Became_SQO__c) >= c.trailing_365_days_start
+        THEN o.Full_Opportunity_ID__c 
+      END)
+      ELSE NULL
+    END AS avg_margin_aum_per_sqo,
+    -- Avg Margin AUM per Joined (historical, trailing 365 days)
+    -- Standardized: All SGMs use trailing 365 days and require is_sqo = 1 (matches enterprise/standard logic)
+    CASE 
+      WHEN COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1  -- Must be an SQO
+        AND o.is_joined = 1 
+        AND DATE(o.advisor_join_date__c) >= c.trailing_365_days_start
+        AND o.Margin_AUM__c > 0
+        THEN o.Full_Opportunity_ID__c 
+      END) > 0
+      THEN (SUM(CASE 
+        WHEN o.is_sqo = 1  -- Must be an SQO
+        AND o.is_joined = 1 
+        AND DATE(o.advisor_join_date__c) >= c.trailing_365_days_start
+        AND o.Margin_AUM__c > 0
+        THEN o.Margin_AUM__c ELSE 0 
+      END) / 1000000) / COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1  -- Must be an SQO
+        AND o.is_joined = 1 
+        AND DATE(o.advisor_join_date__c) >= c.trailing_365_days_start
+        AND o.Margin_AUM__c > 0
+        THEN o.Full_Opportunity_ID__c 
+      END)
+      ELSE NULL
+    END AS avg_margin_aum_per_joined,
+    -- SQO to Joined conversion rate (historical, trailing 365 days)
+    CASE 
+      WHEN COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1 
+        AND DATE(o.Date_Became_SQO__c) >= c.trailing_365_days_start
+        THEN o.Full_Opportunity_ID__c 
+      END) > 0
+      THEN COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1 
+        AND o.is_joined = 1
+        AND DATE(o.Date_Became_SQO__c) >= c.trailing_365_days_start
+        THEN o.Full_Opportunity_ID__c 
+      END) / COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1 
+        AND DATE(o.Date_Became_SQO__c) >= c.trailing_365_days_start
+        THEN o.Full_Opportunity_ID__c 
+      END)
+      ELSE NULL
+    END AS sqo_to_joined_conversion_rate,
+    COUNT(DISTINCT CASE 
+      WHEN o.is_sqo = 1 
+      AND DATE(o.Date_Became_SQO__c) >= c.trailing_365_days_start
+      THEN o.Full_Opportunity_ID__c 
+    END) AS historical_sqo_count_12m,
+    COUNT(DISTINCT CASE 
+      WHEN o.is_sqo = 1  -- Must be an SQO
+      AND o.is_joined = 1 
+      AND DATE(o.advisor_join_date__c) >= c.trailing_365_days_start
+      THEN o.Full_Opportunity_ID__c 
+    END) AS historical_joined_count_12m
+  FROM Opp_Base o
+  CROSS JOIN Current_Date_Context c
+  WHERE o.sgm_name IS NOT NULL
+  GROUP BY o.sgm_name
+),
+
+-- Overall averages (fallback if SGM doesn't have enough history)
+Overall_Historical_Metrics AS (
+  SELECT
+    AVG(h.avg_margin_aum_per_sqo) AS overall_avg_margin_aum_per_sqo,
+    AVG(h.avg_margin_aum_per_joined) AS overall_avg_margin_aum_per_joined,
+    AVG(h.sqo_to_joined_conversion_rate) AS overall_sqo_to_joined_conversion_rate
+  FROM SGM_Historical_Metrics h
+),
+
+-- Conversion rate from vw_conversion_rates (trailing 365 days)
+Conversion_Rate_365d AS (
+  SELECT
+    CASE 
+      WHEN SUM(sqo_to_joined_denominator) > 0
+      THEN SUM(sqo_to_joined_numerator) / SUM(sqo_to_joined_denominator)
+      ELSE NULL
+    END AS sqo_to_joined_conversion_rate_365d
+  FROM `savvy-gtm-analytics.savvy_analytics.vw_conversion_rates`
+  WHERE cohort_month >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 365 DAY)
+    AND sqo_to_joined_denominator > 0
+),
+
+-- Enterprise metrics for Bre McDaniel (trailing 365 days)
+-- These are used for Bre's required_sqos_per_quarter calculation
+Enterprise_Metrics_365d AS (
+  SELECT
+    -- Average Margin AUM per Joined for Bre McDaniel (trailing 365 days)
+    CASE 
+      WHEN COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1  -- Must be an SQO
+        AND o.is_joined = 1 
+        AND DATE(o.advisor_join_date__c) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+        AND o.Margin_AUM__c > 0
+        AND o.sgm_name = 'Bre McDaniel'
+        THEN o.Full_Opportunity_ID__c 
+      END) > 0
+      THEN (SUM(CASE 
+        WHEN o.is_sqo = 1  -- Must be an SQO
+        AND o.is_joined = 1 
+        AND DATE(o.advisor_join_date__c) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+        AND o.Margin_AUM__c > 0
+        AND o.sgm_name = 'Bre McDaniel'
+        THEN o.Margin_AUM__c ELSE 0 
+      END) / 1000000) / COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1  -- Must be an SQO
+        AND o.is_joined = 1 
+        AND DATE(o.advisor_join_date__c) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+        AND o.Margin_AUM__c > 0
+        AND o.sgm_name = 'Bre McDaniel'
+        THEN o.Full_Opportunity_ID__c 
+      END)
+      ELSE NULL
+    END AS enterprise_365_average_margin_aum,
+    -- SQO to Joined conversion rate for Bre McDaniel (trailing 365 days)
+    CASE 
+      WHEN COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1 
+        AND DATE(o.Date_Became_SQO__c) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+        AND o.sgm_name = 'Bre McDaniel'
+        THEN o.Full_Opportunity_ID__c 
+      END) > 0
+      THEN COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1 
+        AND o.is_joined = 1
+        AND DATE(o.Date_Became_SQO__c) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+        AND o.sgm_name = 'Bre McDaniel'
+        THEN o.Full_Opportunity_ID__c 
+      END) / COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1 
+        AND DATE(o.Date_Became_SQO__c) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+        AND o.sgm_name = 'Bre McDaniel'
+        THEN o.Full_Opportunity_ID__c 
+      END)
+      ELSE NULL
+    END AS enterprise_365_sqo_to_joined_conversion
+  FROM Opp_Base o
+  WHERE o.sgm_name = 'Bre McDaniel'
+),
+
+-- Standard metrics for everyone except Bre McDaniel (trailing 365 days)
+-- Excludes deals >= $30M Margin AUM to avoid inflating averages
+-- Excludes Bre McDaniel from conversion rate calculation
+Standard_Metrics_365d AS (
+  SELECT
+    -- Average Margin AUM per Joined (trailing 365 days, excluding enterprise deals >= $30M and Bre)
+    CASE 
+      WHEN COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1  -- Must be an SQO
+        AND o.is_joined = 1 
+        AND DATE(o.advisor_join_date__c) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+        AND o.Margin_AUM__c > 0
+        AND o.Margin_AUM__c < 30000000  -- Exclude enterprise deals (>= $30M)
+        AND o.sgm_name != 'Bre McDaniel'  -- Exclude Bre
+        THEN o.Full_Opportunity_ID__c 
+      END) > 0
+      THEN (SUM(CASE 
+        WHEN o.is_sqo = 1  -- Must be an SQO
+        AND o.is_joined = 1 
+        AND DATE(o.advisor_join_date__c) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+        AND o.Margin_AUM__c > 0
+        AND o.Margin_AUM__c < 30000000  -- Exclude enterprise deals
+        AND o.sgm_name != 'Bre McDaniel'  -- Exclude Bre
+        THEN o.Margin_AUM__c ELSE 0 
+      END) / 1000000) / COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1  -- Must be an SQO
+        AND o.is_joined = 1 
+        AND DATE(o.advisor_join_date__c) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+        AND o.Margin_AUM__c > 0
+        AND o.Margin_AUM__c < 30000000  -- Exclude enterprise deals
+        AND o.sgm_name != 'Bre McDaniel'  -- Exclude Bre
+        THEN o.Full_Opportunity_ID__c 
+      END)
+      ELSE NULL
+    END AS standard_365_average_margin_aum,
+    -- SQO to Joined conversion rate (trailing 365 days, excluding Bre McDaniel)
+    CASE 
+      WHEN COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1 
+        AND DATE(o.Date_Became_SQO__c) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+        AND o.sgm_name != 'Bre McDaniel'  -- Exclude Bre
+        THEN o.Full_Opportunity_ID__c 
+      END) > 0
+      THEN COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1 
+        AND o.is_joined = 1
+        AND DATE(o.Date_Became_SQO__c) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+        AND o.sgm_name != 'Bre McDaniel'  -- Exclude Bre
+        THEN o.Full_Opportunity_ID__c 
+      END) / COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1 
+        AND DATE(o.Date_Became_SQO__c) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+        AND o.sgm_name != 'Bre McDaniel'  -- Exclude Bre
+        THEN o.Full_Opportunity_ID__c 
+      END)
+      ELSE NULL
+    END AS standard_365_sqo_to_joined_conversion
+  FROM Opp_Base o
+  WHERE o.sgm_name IS NOT NULL
+    AND o.sgm_name != 'Bre McDaniel'
+),
+
+-- Firm-wide averages excluding Enterprise deals (for required calculations)
+-- Calculates directly from opportunity data, excluding deals >= $30M Margin AUM
+-- Uses trailing 365 days for Margin AUM average and conversion rate from vw_conversion_rates
+-- NOTE: This is kept for backward compatibility but standard_365 metrics should be used for new calculations
+Firm_Wide_Averages_Excluding_Enterprise AS (
+  SELECT
+    -- Average Margin AUM per Joined (trailing 365 days, excluding enterprise deals >= $30M)
+    -- Only includes opportunities where is_SQO = 1 AND StageName = 'Joined'
+    -- Only includes opportunities with Margin_AUM__c > 0 to avoid diluting the average
+    CASE 
+      WHEN COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1  -- Must be an SQO
+        AND o.is_joined = 1 
+        AND DATE(o.advisor_join_date__c) >= c.trailing_365_days_start
+        AND o.Margin_AUM__c > 0
+        AND o.Margin_AUM__c < 30000000  -- Exclude enterprise deals (>= $30M)
+        THEN o.Full_Opportunity_ID__c 
+      END) > 0
+      THEN (SUM(CASE 
+        WHEN o.is_sqo = 1  -- Must be an SQO
+        AND o.is_joined = 1 
+        AND DATE(o.advisor_join_date__c) >= c.trailing_365_days_start
+        AND o.Margin_AUM__c > 0
+        AND o.Margin_AUM__c < 30000000  -- Exclude enterprise deals
+        THEN o.Margin_AUM__c ELSE 0 
+      END) / 1000000) / COUNT(DISTINCT CASE 
+        WHEN o.is_sqo = 1  -- Must be an SQO
+        AND o.is_joined = 1 
+        AND DATE(o.advisor_join_date__c) >= c.trailing_365_days_start
+        AND o.Margin_AUM__c > 0
+        AND o.Margin_AUM__c < 30000000  -- Exclude enterprise deals
+        THEN o.Full_Opportunity_ID__c 
+      END)
+      ELSE NULL
+    END AS firm_wide_avg_margin_aum_per_joined,
+    -- SQO to Joined conversion rate from vw_conversion_rates (trailing 365 days)
+    MAX(cr.sqo_to_joined_conversion_rate_365d) AS firm_wide_sqo_to_joined_conversion_rate_365d
+  FROM Opp_Base o
+  CROSS JOIN Current_Date_Context c
+  CROSS JOIN Conversion_Rate_365d cr
+  WHERE o.sgm_name IS NOT NULL
+),
+
+-- Current pipeline status per SGM
+SGM_Current_Pipeline AS (
+  SELECT
+    o.sgm_name,
+    COUNT(DISTINCT CASE 
+      WHEN o.is_sqo = 1 
+      AND o.is_in_pipeline = 1
+      THEN o.Full_Opportunity_ID__c 
+    END) AS current_pipeline_sqo_count,
+    SUM(CASE 
+      WHEN o.is_sqo = 1 
+      AND o.is_in_pipeline = 1
+      THEN COALESCE(o.Margin_AUM__c, 0) ELSE 0 
+    END) / 1000000 AS current_pipeline_sqo_margin_aum,
+    SUM(CASE 
+      WHEN o.is_sqo = 1 
+      AND o.is_in_pipeline = 1
+      THEN o.estimated_margin_aum ELSE 0 
+    END) AS current_pipeline_sqo_margin_aum_estimate,
+    SUM(CASE 
+      WHEN o.is_sqo = 1 
+      AND o.is_in_pipeline = 1
+      THEN COALESCE(o.Margin_AUM__c, 0) * o.stage_probability
+      ELSE 0 
+    END) / 1000000 AS current_pipeline_sqo_weighted_margin_aum,
+    SUM(CASE 
+      WHEN o.is_sqo = 1 
+      AND o.is_in_pipeline = 1
+      THEN o.estimated_margin_aum * o.stage_probability
+      ELSE 0 
+    END) AS current_pipeline_sqo_weighted_margin_aum_estimate,
+    
+    -- *** NEW METRIC: ACTIVE (NON-STALE) WEIGHTED VALUE (V2 Logic) ***
+    -- Uses dynamic stale thresholds and stale decay for older active deals
+    -- UPDATED: Removed "New Deal Penalty" (data shows young deals have higher win rate)
+    -- UPDATED: Added "Stale Decay" (0.80x) for deals >180 days but still active
+    SUM(CASE 
+      WHEN o.is_sqo = 1 
+      AND o.is_in_pipeline = 1
+      AND (
+        -- Dynamic stale logic based on deal size
+        (o.estimated_margin_aum < 5 AND (o.sqo_age_days IS NULL OR o.sqo_age_days <= 90))
+        OR (o.estimated_margin_aum >= 5 AND o.estimated_margin_aum < 15 AND (o.sqo_age_days IS NULL OR o.sqo_age_days <= 120))
+        OR (o.estimated_margin_aum >= 15 AND o.estimated_margin_aum < 30 AND (o.sqo_age_days IS NULL OR o.sqo_age_days <= 180))
+        OR (o.estimated_margin_aum >= 30 AND (o.sqo_age_days IS NULL OR o.sqo_age_days <= 240))
+      )
+      THEN o.estimated_margin_aum * o.stage_probability * 
+        CASE 
+          -- Stale Decay: Deals >180 days but still active get 0.80x (momentum decay)
+          -- This primarily affects Enterprise deals (â‰¥$30M) which have 240-day stale threshold
+          WHEN o.sqo_age_days IS NOT NULL AND o.sqo_age_days > 180 THEN 0.80
+          -- Fresh deals (0-180 days): Full value (data shows they have higher win rate)
+          ELSE 1.0
+        END
+      ELSE 0 
+    END) AS current_pipeline_active_weighted_margin_aum_estimate,
+
+    -- Stale Metrics (V2 Dynamic Logic: Deal-size dependent thresholds)
+    SUM(CASE 
+      WHEN o.is_sqo = 1
+      AND o.is_in_pipeline = 1
+      AND (
+        (o.estimated_margin_aum < 5 AND o.sqo_age_days > 90)
+        OR (o.estimated_margin_aum >= 5 AND o.estimated_margin_aum < 15 AND o.sqo_age_days > 120)
+        OR (o.estimated_margin_aum >= 15 AND o.estimated_margin_aum < 30 AND o.sqo_age_days > 180)
+        OR (o.estimated_margin_aum >= 30 AND o.sqo_age_days > 240)
+      )
+      THEN COALESCE(o.Margin_AUM__c, 0)
+      ELSE 0 
+    END) / 1000000 AS current_pipeline_sqo_stale_margin_aum,
+    SUM(CASE 
+      WHEN o.is_sqo = 1
+      AND o.is_in_pipeline = 1
+      AND (
+        (o.estimated_margin_aum < 5 AND o.sqo_age_days > 90)
+        OR (o.estimated_margin_aum >= 5 AND o.estimated_margin_aum < 15 AND o.sqo_age_days > 120)
+        OR (o.estimated_margin_aum >= 15 AND o.estimated_margin_aum < 30 AND o.sqo_age_days > 180)
+        OR (o.estimated_margin_aum >= 30 AND o.sqo_age_days > 240)
+      )
+      THEN o.estimated_margin_aum
+      ELSE 0 
+    END) AS current_pipeline_sqo_stale_margin_aum_estimate,
+    COUNT(DISTINCT CASE 
+      WHEN o.is_sqo = 1
+      AND o.is_in_pipeline = 1
+      AND (
+        (o.estimated_margin_aum < 5 AND o.sqo_age_days > 90)
+        OR (o.estimated_margin_aum >= 5 AND o.estimated_margin_aum < 15 AND o.sqo_age_days > 120)
+        OR (o.estimated_margin_aum >= 15 AND o.estimated_margin_aum < 30 AND o.sqo_age_days > 180)
+        OR (o.estimated_margin_aum >= 30 AND o.sqo_age_days > 240)
+      )
+      THEN o.Full_Opportunity_ID__c 
+    END) AS current_pipeline_stale_sqo_count,
+    
+    -- Other counts
+    COUNT(DISTINCT CASE 
+      WHEN o.is_in_pipeline = 1
+      THEN o.Full_Opportunity_ID__c 
+    END) AS current_pipeline_opp_count,
+    SUM(CASE 
+      WHEN o.is_in_pipeline = 1
+      THEN COALESCE(o.Margin_AUM__c, 0) ELSE 0 
+    END) / 1000000 AS current_pipeline_margin_aum,
+    
+    -- Current Quarter
+    COUNT(DISTINCT CASE 
+      WHEN o.is_sqo = 1 
+      AND o.sqo_quarter = c.current_quarter_start
+      THEN o.Full_Opportunity_ID__c 
+    END) AS current_quarter_sqo_count,
+    SUM(CASE 
+      WHEN o.is_sqo = 1 
+      AND o.sqo_quarter = c.current_quarter_start
+      THEN COALESCE(o.Margin_AUM__c, 0) ELSE 0 
+    END) / 1000000 AS current_quarter_sqo_margin_aum,
+    COUNT(DISTINCT CASE 
+      WHEN o.is_joined = 1 
+      AND o.joined_quarter = c.current_quarter_start
+      THEN o.Full_Opportunity_ID__c 
+    END) AS current_quarter_joined_count,
+    SUM(CASE 
+      WHEN o.is_joined = 1 
+      AND o.joined_quarter = c.current_quarter_start
+      THEN COALESCE(o.Margin_AUM__c, 0) ELSE 0 
+    END) / 1000000 AS current_quarter_joined_margin_aum
+  FROM Opp_Base o
+  CROSS JOIN Current_Date_Context c
+  WHERE o.sgm_name IS NOT NULL
+  GROUP BY o.sgm_name
+),
+
+-- Calculate effective metrics for required calculations
+-- Use firm-wide metrics for On Ramp SGMs OR SGMs with no joined history
+SGM_Effective_Metrics AS (
+  SELECT
+    sgm.sgm_name,
+    sgm.sgm_user_id,
+    sgm.Is_SGM__c,
+    sgm.IsActive,
+    h.avg_margin_aum_per_sqo,
+    h.avg_margin_aum_per_joined,
+    h.sqo_to_joined_conversion_rate,
+    h.historical_sqo_count_12m,
+    h.historical_joined_count_12m,
+    CASE
+      WHEN DATE_DIFF(CURRENT_DATE(), DATE(u.CreatedDate), DAY) <= 120 THEN 1
+      ELSE 0
+    END AS is_on_ramp,
+    CASE
+      WHEN COALESCE(h.historical_joined_count_12m, 0) = 0 THEN 1
+      ELSE 0
+    END AS has_no_joined_history,
+    -- Effective metrics: Use firm-wide for On Ramp or no joined history
+    CASE
+      WHEN DATE_DIFF(CURRENT_DATE(), DATE(u.CreatedDate), DAY) <= 120 
+        OR COALESCE(h.historical_joined_count_12m, 0) = 0
+      THEN o.overall_avg_margin_aum_per_joined
+      ELSE COALESCE(h.avg_margin_aum_per_joined, o.overall_avg_margin_aum_per_joined)
+    END AS effective_avg_margin_aum_per_joined,
+    CASE
+      WHEN DATE_DIFF(CURRENT_DATE(), DATE(u.CreatedDate), DAY) <= 120 
+        OR COALESCE(h.historical_joined_count_12m, 0) = 0
+      THEN o.overall_sqo_to_joined_conversion_rate
+      ELSE COALESCE(h.sqo_to_joined_conversion_rate, o.overall_sqo_to_joined_conversion_rate)
+    END AS effective_sqo_to_joined_conversion_rate
+  FROM Active_SGMs sgm
+  LEFT JOIN SGM_Historical_Metrics h
+    ON sgm.sgm_name = h.sgm_name
+  CROSS JOIN Overall_Historical_Metrics o
+  CROSS JOIN Firm_Wide_Averages_Excluding_Enterprise fw
+  LEFT JOIN `savvy-gtm-analytics.SavvyGTMData.User` u
+    ON sgm.sgm_user_id = u.Id
+)
+
+SELECT
+  e.sgm_name,
+  e.sgm_user_id,
+  e.Is_SGM__c,
+  e.IsActive,
+  
+  -- TARGET (in millions)
+  36.75 AS quarterly_target_margin_aum,
+  
+  -- HISTORICAL METRICS
+  COALESCE(e.avg_margin_aum_per_sqo, o.overall_avg_margin_aum_per_sqo) AS avg_margin_aum_per_sqo,
+  COALESCE(e.avg_margin_aum_per_joined, o.overall_avg_margin_aum_per_joined) AS avg_margin_aum_per_joined,
+  COALESCE(e.sqo_to_joined_conversion_rate, o.overall_sqo_to_joined_conversion_rate) AS sqo_to_joined_conversion_rate,
+  e.historical_sqo_count_12m,
+  e.historical_joined_count_12m,
+  
+  -- ON RAMP AND NO JOINED HISTORY FLAGS
+  e.is_on_ramp,
+  e.has_no_joined_history,
+  
+  -- EFFECTIVE METRICS (for reference)
+  e.effective_avg_margin_aum_per_joined,
+  e.effective_sqo_to_joined_conversion_rate,
+  
+  -- REQUIRED CALCULATIONS
+  -- Required Joined per Quarter: How many Joined advisors needed to hit $36.75M target
+  -- Uses enterprise metrics for Bre McDaniel, standard metrics for everyone else
+  CASE 
+    WHEN e.sgm_name = 'Bre McDaniel' 
+      AND ent.enterprise_365_average_margin_aum > 0
+    THEN CEILING(36.75 / ent.enterprise_365_average_margin_aum)
+    WHEN e.sgm_name != 'Bre McDaniel'
+      AND std.standard_365_average_margin_aum > 0
+    THEN CEILING(36.75 / std.standard_365_average_margin_aum)
+    WHEN fw.firm_wide_avg_margin_aum_per_joined > 0
+    THEN CEILING(36.75 / fw.firm_wide_avg_margin_aum_per_joined)
+    ELSE NULL
+  END AS required_joined_per_quarter,
+  
+  -- Required SQOs per Quarter: How many SQOs needed in pipeline to achieve required Joined
+  -- Formula: CEILING(Required Joined (whole number) / SQOâ†’Joined Conversion Rate)
+  -- IMPORTANT: We first calculate the whole number of Joined needed, then calculate SQOs from that
+  -- This ensures we always get at least 1 whole Joined person (you can't convert 0.45 people!)
+  -- Uses enterprise metrics for Bre McDaniel (trailing 365 days), standard metrics for everyone else (trailing 365 days)
+  CASE 
+    WHEN e.sgm_name = 'Bre McDaniel' 
+      AND ent.enterprise_365_average_margin_aum > 0
+      AND ent.enterprise_365_sqo_to_joined_conversion > 0
+    THEN CEILING(
+      CEILING(36.75 / ent.enterprise_365_average_margin_aum)
+      / ent.enterprise_365_sqo_to_joined_conversion
+    )
+    WHEN e.sgm_name != 'Bre McDaniel'
+      AND std.standard_365_average_margin_aum > 0
+      AND std.standard_365_sqo_to_joined_conversion > 0
+    THEN CEILING(
+      CEILING(36.75 / std.standard_365_average_margin_aum)
+      / std.standard_365_sqo_to_joined_conversion
+    )
+    WHEN fw.firm_wide_avg_margin_aum_per_joined > 0
+      AND fw.firm_wide_sqo_to_joined_conversion_rate_365d > 0
+    THEN CEILING(
+      CEILING(36.75 / fw.firm_wide_avg_margin_aum_per_joined)
+      / fw.firm_wide_sqo_to_joined_conversion_rate_365d
+    )
+    ELSE NULL
+  END AS required_sqos_per_quarter,
+  
+  -- Legacy field: Same as required_sqos_per_quarter (kept for backward compatibility)
+  CASE 
+    WHEN e.sgm_name = 'Bre McDaniel' 
+      AND ent.enterprise_365_average_margin_aum > 0
+      AND ent.enterprise_365_sqo_to_joined_conversion > 0
+    THEN CEILING(
+      CEILING(36.75 / ent.enterprise_365_average_margin_aum)
+      / ent.enterprise_365_sqo_to_joined_conversion
+    )
+    WHEN e.sgm_name != 'Bre McDaniel'
+      AND std.standard_365_average_margin_aum > 0
+      AND std.standard_365_sqo_to_joined_conversion > 0
+    THEN CEILING(
+      CEILING(36.75 / std.standard_365_average_margin_aum)
+      / std.standard_365_sqo_to_joined_conversion
+    )
+    WHEN fw.firm_wide_avg_margin_aum_per_joined > 0
+      AND fw.firm_wide_sqo_to_joined_conversion_rate_365d > 0
+    THEN CEILING(
+      CEILING(36.75 / fw.firm_wide_avg_margin_aum_per_joined)
+      / fw.firm_wide_sqo_to_joined_conversion_rate_365d
+    )
+    ELSE NULL
+  END AS required_sqos_with_conversion_rate,
+  
+  -- ENTERPRISE AND STANDARD METRICS (for Looker Studio scorecard)
+  -- These metrics show the values being used for calculations
+  ent.enterprise_365_average_margin_aum AS enterprise_365_average_margin_aum,
+  ent.enterprise_365_sqo_to_joined_conversion AS enterprise_365_sqo_to_joined_conversion,
+  std.standard_365_average_margin_aum AS standard_365_average_margin_aum,
+  std.standard_365_sqo_to_joined_conversion AS standard_365_sqo_to_joined_conversion,
+  
+  -- CURRENT PIPELINE STATUS
+  COALESCE(p.current_pipeline_sqo_count, 0) AS current_pipeline_sqo_count,
+  COALESCE(p.current_pipeline_sqo_margin_aum, 0) AS current_pipeline_sqo_margin_aum,
+  COALESCE(p.current_pipeline_sqo_margin_aum_estimate, 0) AS current_pipeline_sqo_margin_aum_estimate,
+  COALESCE(p.current_pipeline_sqo_weighted_margin_aum, 0) AS current_pipeline_sqo_weighted_margin_aum,
+  COALESCE(p.current_pipeline_sqo_weighted_margin_aum_estimate, 0) AS current_pipeline_sqo_weighted_margin_aum_estimate,
+  COALESCE(p.current_pipeline_active_weighted_margin_aum_estimate, 0) AS current_pipeline_active_weighted_margin_aum_estimate, -- *** NEWLY ADDED ***
+  COALESCE(p.current_pipeline_sqo_stale_margin_aum, 0) AS current_pipeline_sqo_stale_margin_aum,
+  COALESCE(p.current_pipeline_sqo_stale_margin_aum_estimate, 0) AS current_pipeline_sqo_stale_margin_aum_estimate,
+  COALESCE(p.current_pipeline_stale_sqo_count, 0) AS current_pipeline_stale_sqo_count,
+  COALESCE(p.current_pipeline_opp_count, 0) AS current_pipeline_opp_count,
+  COALESCE(p.current_pipeline_margin_aum, 0) AS current_pipeline_margin_aum,
+  
+  -- CURRENT QUARTER ACTUALS
+  COALESCE(p.current_quarter_sqo_count, 0) AS current_quarter_sqo_count,
+  COALESCE(p.current_quarter_sqo_margin_aum, 0) AS current_quarter_sqo_margin_aum,
+  COALESCE(p.current_quarter_joined_count, 0) AS current_quarter_joined_count,
+  COALESCE(p.current_quarter_joined_margin_aum, 0) AS current_quarter_joined_margin_aum,
+  
+  -- GAP ANALYSIS
+  -- SQO Gap: Required SQOs (with conversion rate, ensuring whole Joined) - Current Pipeline SQOs
+  -- Uses enterprise metrics for Bre McDaniel, standard metrics for everyone else
+  CASE 
+    WHEN e.sgm_name = 'Bre McDaniel' 
+      AND ent.enterprise_365_average_margin_aum > 0
+      AND ent.enterprise_365_sqo_to_joined_conversion > 0
+    THEN CEILING(
+      CEILING(36.75 / ent.enterprise_365_average_margin_aum)
+      / ent.enterprise_365_sqo_to_joined_conversion
+    ) - COALESCE(p.current_pipeline_sqo_count, 0)
+    WHEN e.sgm_name != 'Bre McDaniel'
+      AND std.standard_365_average_margin_aum > 0
+      AND std.standard_365_sqo_to_joined_conversion > 0
+    THEN CEILING(
+      CEILING(36.75 / std.standard_365_average_margin_aum)
+      / std.standard_365_sqo_to_joined_conversion
+    ) - COALESCE(p.current_pipeline_sqo_count, 0)
+    WHEN fw.firm_wide_avg_margin_aum_per_joined > 0
+      AND fw.firm_wide_sqo_to_joined_conversion_rate_365d > 0
+    THEN CEILING(
+      CEILING(36.75 / fw.firm_wide_avg_margin_aum_per_joined)
+      / fw.firm_wide_sqo_to_joined_conversion_rate_365d
+    ) - COALESCE(p.current_pipeline_sqo_count, 0)
+    ELSE NULL
+  END AS sqo_gap_count,
+  36.75 - COALESCE(p.current_pipeline_sqo_margin_aum, 0) AS margin_aum_gap,
+  CASE 
+    WHEN e.effective_avg_margin_aum_per_joined > 0
+    THEN CEILING(36.75 / e.effective_avg_margin_aum_per_joined) 
+         - COALESCE(p.current_quarter_joined_count, 0)
+    ELSE NULL
+  END AS joined_gap_count,
+  36.75 - COALESCE(p.current_quarter_joined_margin_aum, 0) AS joined_margin_aum_gap,
+  
+  -- PIPELINE SUFFICIENCY INDICATORS
+  -- Has Sufficient SQOs: Compares current pipeline SQOs to required SQOs (accounting for conversion rate and whole Joined)
+  -- Uses enterprise metrics for Bre McDaniel, standard metrics for everyone else
+  CASE 
+    WHEN e.sgm_name = 'Bre McDaniel' 
+      AND ent.enterprise_365_average_margin_aum > 0
+      AND ent.enterprise_365_sqo_to_joined_conversion > 0
+      AND COALESCE(p.current_pipeline_sqo_count, 0) >= 
+          CEILING(
+            CEILING(36.75 / ent.enterprise_365_average_margin_aum)
+            / ent.enterprise_365_sqo_to_joined_conversion
+          )
+    THEN 'Yes'
+    WHEN e.sgm_name != 'Bre McDaniel'
+      AND std.standard_365_average_margin_aum > 0
+      AND std.standard_365_sqo_to_joined_conversion > 0
+      AND COALESCE(p.current_pipeline_sqo_count, 0) >= 
+          CEILING(
+            CEILING(36.75 / std.standard_365_average_margin_aum)
+            / std.standard_365_sqo_to_joined_conversion
+          )
+    THEN 'Yes'
+    WHEN e.sgm_name = 'Bre McDaniel' 
+      AND ent.enterprise_365_average_margin_aum > 0
+      AND ent.enterprise_365_sqo_to_joined_conversion > 0
+    THEN 'No'
+    WHEN e.sgm_name != 'Bre McDaniel'
+      AND std.standard_365_average_margin_aum > 0
+      AND std.standard_365_sqo_to_joined_conversion > 0
+    THEN 'No'
+    WHEN fw.firm_wide_avg_margin_aum_per_joined > 0
+      AND fw.firm_wide_sqo_to_joined_conversion_rate_365d > 0
+      AND COALESCE(p.current_pipeline_sqo_count, 0) >= 
+          CEILING(
+            CEILING(36.75 / fw.firm_wide_avg_margin_aum_per_joined)
+            / fw.firm_wide_sqo_to_joined_conversion_rate_365d
+          )
+    THEN 'Yes'
+    WHEN fw.firm_wide_avg_margin_aum_per_joined > 0
+      AND fw.firm_wide_sqo_to_joined_conversion_rate_365d > 0
+    THEN 'No'
+    ELSE 'Unknown'
+  END AS has_sufficient_sqos_in_pipeline,
+  CASE 
+    WHEN COALESCE(p.current_pipeline_sqo_margin_aum, 0) >= 36.75
+    THEN 'Yes'
+    ELSE 'No'
+  END AS has_sufficient_margin_aum_in_pipeline,
+  CASE 
+    WHEN COALESCE(p.current_quarter_joined_margin_aum, 0) >= 36.75
+    THEN 'On Track'
+    WHEN COALESCE(p.current_quarter_joined_margin_aum, 0) > 0
+    THEN 'Behind'
+    ELSE 'No Activity'
+  END AS quarterly_target_status,
+  
+  -- PERCENTAGE OF TARGET
+  CASE 
+    WHEN COALESCE(p.current_pipeline_sqo_margin_aum, 0) > 0
+    THEN ROUND((COALESCE(p.current_pipeline_sqo_margin_aum, 0) / 36.75) * 100, 1)
+    ELSE 0
+  END AS pipeline_margin_aum_pct_of_target,
+  CASE 
+    WHEN COALESCE(p.current_quarter_joined_margin_aum, 0) > 0
+    THEN ROUND((COALESCE(p.current_quarter_joined_margin_aum, 0) / 36.75) * 100, 1)
+    ELSE 0
+  END AS current_quarter_joined_pct_of_target,
+  
+  CURRENT_DATE() AS as_of_date
+
+FROM SGM_Effective_Metrics e
+CROSS JOIN Overall_Historical_Metrics o
+CROSS JOIN Firm_Wide_Averages_Excluding_Enterprise fw
+CROSS JOIN Enterprise_Metrics_365d ent
+CROSS JOIN Standard_Metrics_365d std
+LEFT JOIN SGM_Current_Pipeline p
+  ON e.sgm_name = p.sgm_name
+ORDER BY e.sgm_name
